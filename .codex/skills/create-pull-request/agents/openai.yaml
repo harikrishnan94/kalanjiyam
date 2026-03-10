@@ -1,0 +1,4 @@
+interface:
+  display_name: "Create Pull Request"
+  short_description: "Prepare and open a pull request"
+  default_prompt: "Use $create-pull-request to prepare and open a pull request against main."

@@ -8,8 +8,11 @@ Keep the codebase intentionally small, clear, and easy to extend.
 
 ## Naming
 
-- Component, module, and subsystem names should use transliterated Tamil
-  written in ASCII.
+- Database components, modules, and subsystems should use
+  transliterated Tamil written in ASCII.
+- For general-purpose files, tests, docs, and supporting code, 
+  commit message use clear English names unless Tamil naming
+  is explicitly requested.
 - Do not use Tamil script or any non-ASCII characters in source code,
   docs, tests, or comments.
 - Public API names may remain in English when that improves clarity for

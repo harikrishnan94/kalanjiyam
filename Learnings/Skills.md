@@ -68,6 +68,17 @@ Apply formatting:
 cargo fmt
 ```
 
+## GitHub Checks
+
+GitHub Actions validates the same formatting command with:
+
+```bash
+cargo fmt --all --check
+```
+
+GitHub Actions also rejects commits when any commit-message line is
+longer than 72 characters.
+
 ## Notes
 
 - Keep the binary entry point minimal.
