@@ -1,0 +1,15 @@
+[package]
+name = "kalanjiyam"
+version = "0.1.0"
+edition = "2024"
+description = "High-level starting point for the kalanjiyam key-value store"
+license = "MIT"
+publish = false
+
+[lib]
+name = "kalanjiyam"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kalanjiyam"
+path = "src/main.rs"
