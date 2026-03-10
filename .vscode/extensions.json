@@ -1,0 +1,10 @@
+{
+  "recommendations": [
+    "github.vscode-github-actions",
+    "github.vscode-pull-request-github",
+    "fill-labs.dependi",
+    "rust-lang.rust-analyzer",
+    "tamasfe.even-better-toml",
+    "vadimcn.vscode-lldb"
+  ]
+}
