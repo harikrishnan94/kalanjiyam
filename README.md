@@ -1,6 +1,12 @@
 # kalanjiyam
 
 `kalanjiyam` is  a distributed, ACID-compliant key-value store.
+Its storage engine is named `Pezhai`.
+
+## Design Docs
+
+The primary storage-engine specification lives in
+`docs/pezhai-storage-engine-spec.md`.
 
 ## AI Agent Instructions
 
