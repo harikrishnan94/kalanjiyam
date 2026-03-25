@@ -68,13 +68,22 @@ Success means:
 
 - the public operations `open`, `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`,
   `scan`, `sync`, and `stats` have fully specified externally visible behavior [BEHAVIORAL]
+- language bindings MAY expose those operations through asynchronous handles, but awaiting them
+  MUST preserve the same behavior defined here for the named operations [BEHAVIORAL]
+- implementations MAY route those operations through one shared engine-owned internal dispatcher
+  that returns an immediate result, one durability wait, or one immutable read plan, as long as
+  the externally visible behavior of the named operations remains exactly the same [BEHAVIORAL]
+- implementations MAY realize those operations through an engine-owned planning step that either
+  completes immediately, yields one immutable read plan, or yields one durability waiter, but the
+  externally visible result MUST remain the same operation semantics defined here [BEHAVIORAL]
 - the on-disk layout is defined at byte level for `CURRENT`, WAL segments, metadata checkpoints,
   and shared data `.kjm` files [BEHAVIORAL]
 - `config.toml` is parsed semantically as durable operator input rather than as a byte-for-byte
   compatibility artifact [BEHAVIORAL]
 - snapshot visibility is unambiguous and does not depend on logical-shard history [BEHAVIORAL]
 - logical shard split and merge remain metadata-only [BEHAVIORAL]
-- stale background data publishes (flush, compaction, logical split/merge) are rejected by current-generation or source-range preconditions [MERGED with #11.5] [BEHAVIORAL]
+- stale background data publishes (flush, compaction, logical split/merge) are rejected by
+  current-generation or source-range preconditions [MERGED with #11.5] [BEHAVIORAL]
 
 Worked example:
 
@@ -208,7 +217,8 @@ The durable format rules are:
 - `config.toml` is semantic TOML durable state [BEHAVIORAL]
 - the remaining durable artifacts use the binary layouts defined in this document [BEHAVIORAL]
 - all persistent bytes are defined by this document [BEHAVIORAL]
-- a reader MUST reject any durable artifact that violates the byte-level rules in this document [BEHAVIORAL]
+- a reader MUST reject any durable artifact that violates the byte-level rules in this document
+  [BEHAVIORAL]
 
 Directory layout overview:
 
@@ -253,7 +263,8 @@ Rules:
 - every checksum field stores the CRC32C of the covered bytes [BEHAVIORAL]
 - when a structure contains its own checksum field, that field is zeroed for the checksum
   computation [BEHAVIORAL]
-- all bytes covered by a checksum, including required-zero padding bytes, MUST match exactly [BEHAVIORAL]
+- all bytes covered by a checksum, including required-zero padding bytes, MUST match exactly
+  [BEHAVIORAL]
 
 ### 4.4 Enum encodings
 
@@ -307,7 +318,8 @@ function validate_wal_record_type(record_type):
 
 ### 4.6 `BoundWire`
 
-`BoundWire` exists to encode logical-shard boundaries and other current range descriptions. [BEHAVIORAL]
+`BoundWire` exists to encode logical-shard boundaries and other current range descriptions.
+[BEHAVIORAL]
 
 Exact encoding:
 
@@ -409,7 +421,8 @@ Rules:
 
 - the file MUST be valid TOML [BEHAVIORAL]
 - unknown keys MAY be ignored
-- comments, blank lines, key order, and table order MUST NOT change the accepted meaning [BEHAVIORAL]
+- comments, blank lines, key order, and table order MUST NOT change the accepted meaning
+  [BEHAVIORAL]
 - implementations MAY rewrite the file into a preferred canonical layout when they create or update
   it, but `open()` MUST validate values rather than exact source bytes [BEHAVIORAL]
 
@@ -418,9 +431,12 @@ Example configuration:
 ```toml
 [engine]
 sync_mode = "per_write"
+page_size_bytes = 4096
 
 [wal]
 segment_bytes = 1073741824
+group_commit_bytes = 65536
+group_commit_max_delay_ms = 50
 
 [lsm]
 memtable_flush_bytes = 67108864
@@ -438,13 +454,23 @@ If `config.toml` is not valid TOML or violates the schema and validation rules i
 - `engine.sync_mode`:
   type enum string; default `"per_write"`; mutability reopen-only; validation MUST be
   `"per_write"` or `"manual"` [PERF]
+- `engine.page_size_bytes`:
+  type `u32`; default `4096`; mutability reopen-only; validation power of two in
+  `4096..=32768` [BEHAVIORAL]
 - `wal.segment_bytes`:
   type `u64`; default `1073741824`; mutability reopen-only; validation
   `> max_single_wal_record_bytes + 256` [PERF]
+- `wal.group_commit_bytes`:
+  type `u64`; default `65536`; mutability reopen-only; validation `> 0` and
+  `< wal.segment_bytes` [PERF]
+- `wal.group_commit_max_delay_ms`:
+  type `u64`; default `50`; mutability reopen-only; validation `> 0` [PERF]
 - `lsm.memtable_flush_bytes`:
-  type `u64`; default `67108864`; mutability reopen-only; validation `>= 4 * 4096` [PERF]
+  type `u64`; default `67108864`; mutability reopen-only; validation
+  `>= 4 * engine.page_size_bytes` [PERF]
 - `lsm.base_level_bytes`:
-  type `u64`; default `268435456`; mutability reopen-only; validation `>= memtable_flush_bytes` [PERF]
+  type `u64`; default `268435456`; mutability reopen-only; validation
+  `>= memtable_flush_bytes` [PERF]
 - `lsm.level_fanout`:
   type `u32`; default `10`; mutability reopen-only; validation `2..32` [PERF]
 - `lsm.l0_file_threshold`:
@@ -455,7 +481,7 @@ If `config.toml` is not valid TOML or violates the schema and validation rules i
 Implementation constants:
 
 - `format_major = 1`
-- `page_size_bytes = 4096`
+- `default_page_size_bytes = 4096`
 - `max_key_bytes = 1024`
 - `max_value_bytes = 268435455`
 - `max_single_wal_record_bytes = 64 + 8 + max_key_bytes + max_value_bytes + 8`
@@ -464,8 +490,12 @@ Implementation constants:
 `sync_mode` semantics:
 
 - `"per_write"`:
-  - `put`, `delete`, and all publish records acknowledge only after their WAL record is durable
-  - multiple waiting operations MAY share one fsync
+  - `put`, `delete`, and all publish records acknowledge only after the durable frontier covers
+    their WAL seqno
+  - multiple waiting operations MAY share one group fsync
+  - one pending batch MUST flush when either the unsynced bytes since the last durable frontier
+    reach `wal.group_commit_bytes`, or the oldest pending waiter reaches
+    `wal.group_commit_max_delay_ms`
 - `"manual"`:
   - `put`, `delete`, and publish records acknowledge after the record bytes are appended to the
     active segment file
@@ -970,7 +1000,8 @@ For current logical shards:
 
 - `live_size_bytes` is the latest tracked current-byte estimate for that range
 - implementations MAY recompute an exact value on demand by summing, over all user keys in that
-  current range whose highest visible version in the latest state is a `Put`, `len(key) + len(value)`
+  current range whose highest visible version in the latest state is a `Put`,
+  `len(key) + len(value)`
 - user keys whose highest visible version is `Delete`, or that are absent, contribute `0`
 - ordinary writes MAY leave `live_size_bytes` stale until the next recomputation pass
 - exact recomputation is optional and affects observability and maintenance quality, not read
@@ -1380,6 +1411,9 @@ Active WAL segment:
 
 `wal-<first_seqno_20d>-open.log`
 
+For a brand-new empty active segment, `first_seqno_or_none = NONE_U64`, so the canonical filename
+is `wal-18446744073709551615-open.log`.
+
 #### 8.3.2 Segment header
 
 Every WAL segment begins with a fixed 128-byte header.
@@ -1509,6 +1543,7 @@ Rules:
 - `Put` and `Delete` payloads MUST NOT contain any logical-shard identifier
 - `FlushPublish.source_first_seqno <= FlushPublish.source_last_seqno`
 - `FlushPublish.source_record_count >= 1`
+- `FlushPublish.output_file_count` MUST be `1` in v1
 - `FlushPublish.output_file_metas[]` and `CompactPublish.output_file_metas[]` MUST use unique
   previously unused `FileId` values at accepted publish time
 - `CompactPublish.input_file_ids[]` MUST contain one or more unique `FileId` values sorted in
@@ -1613,10 +1648,7 @@ function append_wal_record(state, record_type, payload, sync_mode):
         state.open_instance_failed <- true
         return Err(IO)
     if sync_mode == per_write:
-        attempt fsync(state.active_wal_segment)
-        if fsync failed:
-            state.open_instance_failed <- true
-            return Err(IO)
+        register durability waiter at seqno
     return Ok({seqno = seqno})
 ```
 
@@ -1805,6 +1837,9 @@ Layout:
 Rules:
 
 - `header_crc32c` covers bytes `0..127` with bytes `88..91` zeroed
+- `page_size_bytes` MUST be a power of two in `4096..=32768`
+- writers MUST set `page_size_bytes` to `engine.page_size_bytes` from the config in effect when
+  the artifact is created
 - `physical_bytes_total` MUST equal the exact durable file length
 - shared data files MUST use `header_bytes = 128`
 - metadata checkpoint files MUST use `header_bytes = 192`
@@ -2135,6 +2170,11 @@ function validate_metadata_list_block(block_bytes):
 
 ### 9.1 `open(config_path)` (`FR-OPEN`)
 
+Language-binding note:
+
+- the Rust binding MAY expose `open(config_path)` as one asynchronous handle-construction step, but
+  completion MUST mean the same recovered engine state described below [BEHAVIORAL]
+
 Why it exists:
 
 `open()` establishes the initial shared data manifest, the current logical-shard map, the retained
@@ -2157,8 +2197,8 @@ Recovery rules:
 - if `CURRENT` is absent and there are no WAL segments and no metadata files, `open()` starts from
   one logical shard `[-inf, +inf)` and an empty shared data state
 - if `CURRENT` is absent and WAL segments exist, `open()` replays from that one-range empty state
-- if `CURRENT` is absent and metadata checkpoint files exist but no WAL segment exists, `open()`
-  MUST fail with `Corruption`
+- if `CURRENT` is absent and metadata checkpoint files exist but no WAL segment exists, those
+  checkpoint files are orphan files and MUST NOT affect visible state
 - metadata checkpoints not referenced by `CURRENT` are orphan files and MUST NOT affect visible
   state
 - data files not referenced by the recovered current data manifest are orphan files and MUST NOT
@@ -2342,8 +2382,12 @@ function put(state, key, value):
 
 Complexity:
 
-- `put()` is `Theta(|key| + |value|)` owner-thread time and `Theta(1)` extra RAM beyond the
-  inserted memtable record
+- `put()` is `Theta(|key| + |value| + log K_mem + log V_key)` owner-thread time and
+  `Theta(1 + I_new)` extra RAM beyond the inserted memtable record, where `K_mem` is the active
+  memtable's distinct-key count, `V_key` is the version count already stored for `key`, and
+  `I_new` is `|key|` when the write creates one new per-key index entry and `1` otherwise
+- in `PerWrite` mode, acknowledgement MUST wait until the durable frontier covers the inserted
+  record's seqno
 
 ### 9.5 `delete(key)` (`FR-DELETE`)
 
@@ -2386,8 +2430,11 @@ function delete(state, key):
 
 Complexity:
 
-- `delete()` is `Theta(|key|)` owner-thread time and `Theta(1)` extra RAM beyond the inserted
-  memtable record
+- `delete()` is `Theta(|key| + log K_mem + log V_key)` owner-thread time and
+  `Theta(1 + I_new)` extra RAM beyond the inserted memtable record, where `K_mem`, `V_key`, and
+  `I_new` are defined as in `put()`
+- in `PerWrite` mode, acknowledgement MUST wait until the durable frontier covers the tombstone
+  seqno
 
 ### 9.6 `get(key, snapshot?)` (`FR-GET`)
 
@@ -2515,9 +2562,15 @@ Complexity:
 
 Behavior:
 
-- fsync the active WAL segment
-- if the active WAL segment was already durable up to the current append frontier, `sync()` MAY
-  return success without writing additional bytes
+- register one waiter for the current committed WAL frontier
+- if the durable frontier already covers that seqno, `sync()` MUST return success immediately
+- otherwise `sync()` MUST share the same group-commit path used by `PerWrite` waiters
+- one pending batch MUST flush when either the unsynced bytes since the last durable frontier
+  reach `wal.group_commit_bytes`, or the oldest pending waiter reaches
+  `wal.group_commit_max_delay_ms`
+- the returned `durable_seqno` MUST be the published durable frontier that covers the request
+- one WAL sync failure MUST fail every waiter in the affected batch and MUST mark the live instance
+  unsafe for further writes until restart
 
 Worked example:
 
@@ -2537,13 +2590,17 @@ Normative pseudocode:
 
 ```text
 function sync(state):
-    fsync(state.active_wal_segment)
-    return Ok(())
+    target_seqno = state.last_committed_seqno
+    if state.durable_seqno >= target_seqno:
+        return Ok({durable_seqno = state.durable_seqno})
+    register_sync_waiter(state, target_seqno)
+    wait until published durable frontier covers target_seqno
+    return Ok({durable_seqno = state.durable_seqno})
 ```
 
 Complexity:
 
-- `sync()` is `Theta(1)` owner-thread work plus one WAL fsync
+- `sync()` is `Theta(1)` owner-thread work plus up to one shared WAL fsync for its batch
 
 ### 9.9 `stats()` (`FR-STATS`)
 
@@ -2628,7 +2685,10 @@ function freeze_active_memtable(state):
 
 Complexity:
 
-- `freeze_active_memtable()` is `Theta(1)` time and `Theta(1)` extra RAM
+- `freeze_active_memtable()` is `Theta(N_active + R_manifest)` time and
+  `Theta(N_active + R_manifest)` extra RAM, where `N_active` is the active-memtable record count
+  and `R_manifest` is the number of file and frozen-memtable references copied into the next
+  retained manifest snapshot
 
 ### 10.2 Flush frozen memtable (`IM-FLUSH`)
 
@@ -2640,14 +2700,14 @@ manifest.
 Behavior:
 
 1. choose the oldest frozen memtable
-2. rewrite its contents into sorted L0 output files sized by `target_file_bytes(L0)`
-3. write those output files to temporary paths
+2. rewrite its contents into exactly one sorted L0 output file in v1
+3. write that output file to one temporary path
 4. at publish time, validate:
    - current `data_generation == data_generation_expected`
    - the chosen source frozen memtable still matches the oldest frozen source identified by
      `source_first_seqno`, `source_last_seqno`, and `source_record_count`
-5. allocate unique unused `FileId` values
-6. rename the temporary files to canonical filenames
+5. allocate one unique unused `FileId`
+6. rename the temporary file to its canonical filename
 7. append one `FlushPublish` record
 8. install the next data manifest snapshot
 
@@ -2658,28 +2718,28 @@ Frozen memtable 21:
   90 MiB of sorted internal records
 
 Flush:
-  produces two L0 files
+  produces one L0 file
   installs data_generation + 1
 ```
 
 ASCII diagram:
 
 ```text
-frozen memtable -> temp files -> canonical data files -> FlushPublish -> new data manifest
+frozen memtable -> temp file -> canonical data file -> FlushPublish -> new data manifest
 ```
 
 Normative pseudocode:
 
 ```text
 function flush_one_frozen_memtable(state, frozen):
-    outputs = build_l0_files_from_frozen_memtable(state, frozen)
+    output = build_one_l0_file_from_frozen_memtable(state, frozen)
     update = {
         data_generation_expected = state.data_generation,
         source_first_seqno = frozen.min_seqno,
         source_last_seqno = frozen.max_seqno,
         source_record_count = frozen.entry_count
     }
-    publish_data_manifest_update(state, FlushPublish, update, outputs)
+    publish_data_manifest_update(state, FlushPublish, update, [output])
 ```
 
 Complexity:
@@ -3187,7 +3247,8 @@ The engine is correct only if all of the following hold:
 9. `get()` and `scan()` ignore logical-shard history and use only `snapshot_seqno` plus the exact
     shared-data source set named by pinned `data_generation` [BEHAVIORAL]
 10. `stats()` reports the latest current logical-shard map, not a historical one [BEHAVIORAL]
-11. current logical-shard ranges are always disjoint, contiguous, and sorted by start bound [BEHAVIORAL]
+11. current logical-shard ranges are always disjoint, contiguous, and sorted by start bound
+    [BEHAVIORAL]
 12. `live_size_bytes` is advisory metadata and need not be exact for read correctness [BEHAVIORAL]
 13. checkpoint capture persists the current published-file manifest and current logical-shard map
     only after draining mutable shared-data state so the checkpointed files represent the exact
@@ -3196,10 +3257,11 @@ The engine is correct only if all of the following hold:
 15. stale background data publishes are rejected by current-generation preconditions plus exact
     flush-source or compaction-input-set checks [BEHAVIORAL]
 16. stale logical split and merge results are rejected by exact source-range checks [BEHAVIORAL]
-17. the current logical-shard map transitions atomically on every install: when a
+17. a flush of one frozen memtable publishes exactly one L0 output file in v1 [BEHAVIORAL]
+18. the current logical-shard map transitions atomically on every install: when a
     `LogicalShardInstall` WAL record is accepted, the full source entry set is replaced by the full
     output entry set with no intermediate state visible to concurrent reads or writes [BEHAVIORAL]
-18. no background operation creates, renames, or modifies any data file in response to a logical
+19. no background operation creates, renames, or modifies any data file in response to a logical
     split or merge; such operations affect only the durable WAL record and the in-memory current
     logical-shard map [BEHAVIORAL]
 
@@ -3239,7 +3301,7 @@ Required tests MUST include at least:
 - `get()` ignores logical-shard changes for a fixed snapshot handle
 - `scan()` ignores logical-shard changes for a fixed snapshot handle
 - snapshot pinned before a freeze and later flush continues to read the pre-freeze source set
-- flush publishes global shared data files and advances only `data_generation`
+- flush publishes exactly one global shared data file and advances only `data_generation`
 - compaction publishes global shared data files and advances only `data_generation`
 - `FlushPublish` replay removes only the pending mutation prefix named by
   `source_first_seqno`, `source_last_seqno`, and `source_record_count`
@@ -3296,6 +3358,9 @@ The intended steady-state design target is an amortized write amplification on t
 `1 + max_levels`, but this is guidance only and is not part of conformance for v1. [PERF]
 
 --- APPENDIX: OUT OF SCOPE FOR NOW ---
-[11.3] `get()` and `scan()` are idempotent for a fixed explicit snapshot handle — revisit when distributed scaling requires it
-[11.3] a stale flush or compaction result MAY be rebuilt against the latest shared data manifest and retried — revisit when distributed scaling requires it
-[11.3] retry MUST NOT reuse a seqno from a failed live append attempt — revisit when distributed scaling requires it
+[11.3] `get()` and `scan()` are idempotent for a fixed explicit snapshot handle. Revisit when
+distributed scaling requires it.
+[11.3] a stale flush or compaction result MAY be rebuilt against the latest shared data manifest
+and retried. Revisit when distributed scaling requires it.
+[11.3] retry MUST NOT reuse a seqno from a failed live append attempt. Revisit when distributed
+scaling requires it.

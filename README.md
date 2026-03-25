@@ -6,7 +6,10 @@ Its storage engine is named `Pezhai`.
 ## Design Docs
 
 The primary storage-engine specification lives in
-`docs/pezhai-storage-engine-spec.md`.
+`docs/specs/pezhai/storage-engine.md`.
+
+The asynchronous server specification lives in
+`docs/specs/pezhai/server.md`.
 
 ## AI Agent Instructions
 

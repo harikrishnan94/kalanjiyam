@@ -13,3 +13,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "kalanjiyam"
 path = "src/main.rs"
+
+[dependencies]
+crc32c = "0.6.8" # Castagnoli CRC32C checksums required by the durable pezhai formats.
+tokio = { version = "1.50.0", features = ["macros", "rt", "sync", "time"] } # In-process async server coordination.
+toml = "1.1.0" # Semantic TOML parsing for config.toml validation.
+
+[dev-dependencies]
+tempfile = "3.27.0" # Temporary directories for engine and server integration tests.
