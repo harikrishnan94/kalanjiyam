@@ -83,6 +83,9 @@ impl Default for StoreOptions {
 
 pub fn run_async<T>(future: impl Future<Output = T>) -> T {
     let runtime = tokio::runtime::Builder::new_current_thread()
+        // Shared integration fixtures now cover loopback TCP, so the helper
+        // enables Tokio's I/O driver in addition to timer support.
+        .enable_io()
         .enable_time()
         .build()
         .expect("integration test runtime should build");

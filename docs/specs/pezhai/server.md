@@ -20,6 +20,8 @@ Source of truth:
   durable bytes, and engine error classes
 - this document is authoritative for server-thread ownership, asynchronous execution, logical RPC
   method shapes, request ordering, cancellation, and backpressure
+- `docs/specs/pezhai/tcp-rpc.md` is authoritative for the concrete proto3-over-TCP framing and
+  binding used by this repository
 - pseudocode blocks labeled `Normative pseudocode` are authoritative for routing and state
   transitions
 - prose examples and diagrams remain explanatory unless a subsection explicitly says
@@ -183,8 +185,9 @@ function conceptual_server_rule(request):
 
 ### 2.2 Out of scope
 
-- byte-level network framing [BEHAVIORAL]
-- any specific transport such as TCP, HTTP, Unix sockets, or gRPC [BEHAVIORAL]
+- byte-level network framing details in this document [BEHAVIORAL]
+- concrete transport wire-format details in this document; see
+  `docs/specs/pezhai/tcp-rpc.md` for the repository's proto3-over-TCP binding [BEHAVIORAL]
 - separate worker processes, remote workers, or cross-process RPC [BEHAVIORAL]
 - external `Open` or `Close` RPC methods [BEHAVIORAL]
 - exposing compaction, flush, checkpoint, garbage collection, logical split, or logical merge as
@@ -351,6 +354,11 @@ Rules:
   `config_path` [BEHAVIORAL]
 - server shutdown MUST stop new request admission before releasing scan sessions, worker waiters,
   and the owned engine instance [BEHAVIORAL]
+- dropping the last live Rust `PezhaiServer` handle MUST request the same internal shutdown
+  cleanup path used by `shutdown()` so detached owner-runtime threads do not outlive the process
+  host indefinitely [BEHAVIORAL]
+- because handle drop cannot await completion, callers that need confirmation MUST still use
+  `shutdown()` followed by `wait_stopped()` [BEHAVIORAL]
 
 ASCII diagram:
 
@@ -515,8 +523,8 @@ This document defines logical RPC only:
 - every request has a method name, request id, payload, and optional cancellation metadata
   [BEHAVIORAL]
 - every response has the matching request id, terminal status, and optional payload [BEHAVIORAL]
-- transports MAY encode these messages in any byte format as long as the logical semantics are
-  preserved [BEHAVIORAL]
+- this specification does not require one byte format for logical compatibility; the repository's
+  concrete wire compatibility profile is defined in `docs/specs/pezhai/tcp-rpc.md` [BEHAVIORAL]
 
 ### 4.6 Common status model
 

@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 
 use tokio::sync::{Notify, mpsc, oneshot};
@@ -447,6 +447,8 @@ pub(crate) struct OwnerRuntime {
     wal_service: WalSyncService,
     stopped: Arc<Notify>,
     lifecycle: Arc<AtomicU8>,
+    drop_shutdown_requested: Arc<AtomicBool>,
+    drop_shutdown_notify: Arc<Notify>,
     expected_request_ids: BTreeMap<String, ClientState>,
     active_requests: BTreeMap<RequestKey, ExternalRequestState>,
     pre_admission_cancellations: BTreeMap<String, BTreeSet<u64>>,
@@ -476,6 +478,8 @@ impl OwnerRuntime {
         wal_result_tx: mpsc::Sender<WalSyncResult>,
         stopped: Arc<Notify>,
         lifecycle: Arc<AtomicU8>,
+        drop_shutdown_requested: Arc<AtomicBool>,
+        drop_shutdown_notify: Arc<Notify>,
     ) -> Self {
         let worker_threads = engine.state().config.maintenance.worker_threads;
         let gc_interval_secs = engine.state().config.maintenance.gc_interval_secs;
@@ -490,6 +494,8 @@ impl OwnerRuntime {
             wal_service: WalSyncService::new(wal_result_tx),
             stopped,
             lifecycle,
+            drop_shutdown_requested,
+            drop_shutdown_notify,
             expected_request_ids: BTreeMap::new(),
             active_requests: BTreeMap::new(),
             pre_admission_cancellations: BTreeMap::new(),
@@ -512,10 +518,18 @@ impl OwnerRuntime {
         self.lifecycle
             .store(LifecycleState::Ready.as_u8(), Ordering::SeqCst);
         loop {
+            if self.drop_shutdown_requested.load(Ordering::SeqCst) {
+                self.finish_after_last_handle_drop().await;
+                break;
+            }
             let next_deadline = self.next_deadline();
             if let Some(deadline) = next_deadline {
                 tokio::select! {
                     biased;
+                    _ = self.drop_shutdown_notify.notified() => {
+                        self.finish_after_last_handle_drop().await;
+                        break;
+                    }
                     Some(control) = self.control_rx.recv() => {
                         if self.handle_control(control).await {
                             break;
@@ -537,6 +551,10 @@ impl OwnerRuntime {
             } else {
                 tokio::select! {
                     biased;
+                    _ = self.drop_shutdown_notify.notified() => {
+                        self.finish_after_last_handle_drop().await;
+                        break;
+                    }
                     Some(control) = self.control_rx.recv() => {
                         if self.handle_control(control).await {
                             break;
@@ -558,6 +576,14 @@ impl OwnerRuntime {
             }
         }
         self.finish_shutdown().await;
+    }
+
+    async fn finish_after_last_handle_drop(&mut self) {
+        // Last-handle drop has no caller waiting for an acknowledgment, but it
+        // still needs the same owner-side cleanup before the runtime exits.
+        self.lifecycle
+            .store(LifecycleState::Stopping.as_u8(), Ordering::SeqCst);
+        let _ = self.begin_shutdown().await;
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -2315,6 +2341,8 @@ checkpoint_interval_secs = 300
         let (wal_result_tx, wal_result_rx) = mpsc::channel(8);
         let stopped = Arc::new(Notify::new());
         let lifecycle = Arc::new(AtomicU8::new(LifecycleState::Ready.as_u8()));
+        let drop_shutdown_requested = Arc::new(AtomicBool::new(false));
+        let drop_shutdown_notify = Arc::new(Notify::new());
         (
             tempdir,
             OwnerRuntime::new(
@@ -2327,6 +2355,8 @@ checkpoint_interval_secs = 300
                 wal_result_tx,
                 stopped,
                 lifecycle,
+                drop_shutdown_requested,
+                drop_shutdown_notify,
             ),
         )
     }
@@ -2630,5 +2660,43 @@ checkpoint_interval_secs = 300
         assert!(matches!(failures[0].1, Err(KalanjiyamError::Cancelled(_))));
 
         run_async(runtime.finish_shutdown());
+    }
+
+    #[test]
+    fn last_handle_drop_signal_stops_the_owner_runtime() {
+        let (_tempdir, mut runtime) = owner_runtime();
+        let drop_shutdown_requested = Arc::clone(&runtime.drop_shutdown_requested);
+        let drop_shutdown_notify = Arc::clone(&runtime.drop_shutdown_notify);
+        let lifecycle = Arc::clone(&runtime.lifecycle);
+
+        run_async(async move {
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                drop_shutdown_requested.store(true, Ordering::SeqCst);
+                drop_shutdown_notify.notify_one();
+            });
+
+            runtime.run().await;
+        });
+
+        assert_eq!(
+            LifecycleState::from_u8(lifecycle.load(Ordering::SeqCst)),
+            LifecycleState::Stopped
+        );
+    }
+
+    #[test]
+    fn pre_set_last_handle_drop_flag_stops_the_owner_runtime() {
+        let (_tempdir, mut runtime) = owner_runtime();
+        runtime
+            .drop_shutdown_requested
+            .store(true, Ordering::SeqCst);
+
+        run_async(runtime.run());
+
+        assert_eq!(
+            LifecycleState::from_u8(runtime.lifecycle.load(Ordering::SeqCst)),
+            LifecycleState::Stopped
+        );
     }
 }

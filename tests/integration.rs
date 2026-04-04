@@ -12,3 +12,6 @@ mod server_matrix;
 
 #[path = "integration/cli_matrix.rs"]
 mod cli_matrix;
+
+#[path = "integration/tcp_matrix.rs"]
+mod tcp_matrix;

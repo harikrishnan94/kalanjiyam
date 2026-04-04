@@ -67,13 +67,31 @@ immutable work inputs, but it is not defined by any specific thread or worker to
 `sevai` owns the in-process server host.
 
 - `mod.rs` defines `PezhaiServer`, the public request and response types, and the bounded mailbox
-  handles used by callers.
+  handles used by callers plus the shared last-handle-drop shutdown signal.
 - `owner.rs` owns the owner-loop state machine, request routing, per-client response ordering,
   scan-session tables, WAL waiters, maintenance retries, and shutdown cleanup.
 - `worker.rs` owns the stateless worker-pool queue used for delegated immutable work.
+- `tcp.rs` owns the proto3-over-TCP adapter that maps framed protobuf messages
+  to the existing external logical request and response API.
+- `proto_map.rs` owns logical-to-wire and wire-to-logical mapping helpers between
+  public server types and generated protobuf types.
+- `benchmark.rs` owns benchmark support for same-process loopback load generation,
+  operation mix expansion, value-size policy, and percentile reporting.
 
 `sevai` does not redefine storage semantics. It hosts the engine and adds transport-facing and
 runtime-facing behavior around it.
+
+### `proto/sevai.proto` and `build.rs`
+
+The protobuf transport boundary is generated, not handwritten.
+
+- `proto/sevai.proto` defines the full external logical RPC method surface and
+  shared wire payload shapes.
+- `build.rs` invokes `protoc` with `protoc-gen-buffa` and emits generated Rust
+  into `OUT_DIR`.
+- generated Rust is included at compile time and is not committed.
+- this keeps wire-shape evolution centralized in protobuf while preserving one
+  explicit mapping layer to public logical Rust types.
 
 ### `src/pezhai/config.rs`
 
@@ -217,6 +235,7 @@ publication.
 - a Tokio current-thread runtime
 - background worker threads
 - a dedicated WAL service thread
+- a loopback TCP transport adapter for external protobuf RPC traffic
 - request admission and backpressure
 - cancellation wiring
 - scan-session management
@@ -237,6 +256,7 @@ Callers interact with the owner thread through bounded async mailboxes:
 - one control queue for cancel, disconnect, and shutdown
 - one worker-result queue
 - one WAL-sync-result queue
+- one best-effort shared shutdown signal fired when the last public server handle is dropped
 
 Each owner turnaround asks the engine whether a request can finish immediately, must wait for WAL
 sync, or should dispatch one immutable plan such as `GetPlan`, `ScanPlan`, or one maintenance
@@ -249,6 +269,11 @@ state directly. Workers execute captured plans and send results back to the owne
 remains the only publisher of visible state by calling helpers such as `finish_get`,
 `finish_scan_page`, `publish_flush_task_result`, `publish_compact_task_result`,
 `publish_checkpoint_task_result`, `publish_gc_task_result`, and `publish_wal_sync_result`.
+
+Explicit `shutdown()` remains the only caller-visible way to await server teardown, but dropping
+the last `PezhaiServer` handle now triggers the same owner-loop cleanup path. That keeps the
+detached owner runtime, worker pool, and WAL service from lingering after embeddings or tests let
+all public handles go out of scope.
 
 Integration tests now validate server behavior only through the public lifecycle and request APIs.
 The production `sevai` modules no longer embed a hidden test-control surface or deterministic
@@ -307,6 +332,26 @@ durability through the dedicated WAL sync thread.
 The dedicated WAL service is part of the hosted execution strategy, but durable-frontier semantics
 remain engine owned. Seqno allocation, append visibility, waiter completion, and stale-result
 rejection are storage rules, not transport rules.
+
+## TCP Transport Adapter and Benchmark Harness
+
+The repository now includes one concrete transport binding in addition to the
+logical API surface: proto3-over-TCP with a fixed 4-byte big-endian length
+prefix per frame.
+
+Architecture implications:
+
+- transport framing and protobuf decode or encode live in `sevai::tcp`.
+- logical storage semantics remain owned by the engine and owner loop.
+- `sevai::proto_map` is the seam between wire contract and public logical
+  request and response types.
+- the benchmark harness starts one in-process `PezhaiServer`, one loopback TCP
+  listener adapter, and multiple same-process TCP benchmark clients.
+- benchmark clients communicate only through the TCP adapter, not through
+  direct in-process server calls.
+
+This split preserves engine and logical-server semantics while making the wire
+transport reusable and testable.
 
 ## Maintenance Model
 
@@ -398,6 +443,8 @@ The specs remain authoritative for semantics and durable-format details.
   and durable bytes.
 - See `docs/specs/pezhai/server.md` for server routing, ordering, cancellation, and backpressure
   rules.
+- See `docs/specs/pezhai/tcp-rpc.md` for concrete protobuf-over-TCP framing,
+  binding, and transport-tooling requirements.
 
 This document summarizes implementation layering only. It does not replace the specs, and it does
 not restate their normative detail.

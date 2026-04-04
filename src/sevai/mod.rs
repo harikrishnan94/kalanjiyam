@@ -9,9 +9,16 @@
 mod owner;
 mod worker;
 
+/// Benchmark support helpers for the loopback TCP harness.
+pub mod benchmark;
+/// Mapping helpers between public server types and generated protobuf types.
+pub mod proto_map;
+/// Loopback TCP transport adapter for the process-scoped server.
+pub mod tcp;
+
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -19,6 +26,18 @@ use crate::error::{ErrorKind, KalanjiyamError};
 use crate::pezhai::engine::PezhaiEngine;
 use crate::pezhai::types::{Bound, GetResponse, StatsResponse, SyncResponse, validate_page_limits};
 use owner::{ControlMessage, ExternalCall, LifecycleState, OwnerRuntime};
+
+/// Generated protobuf transport types for the `sevai` RPC surface.
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals
+)]
+#[allow(clippy::all)]
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/sevai_proto_include.rs"));
+}
 
 /// Bootstrap arguments required to start the process-scoped server.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -192,12 +211,56 @@ pub type RequestPayload = ExternalMethod;
 pub type ResponsePayload = ExternalResponsePayload;
 
 /// Process-scoped server handle.
+///
+/// The last live handle requests asynchronous shutdown automatically when it
+/// is dropped. Callers that need confirmation that cleanup has completed must
+/// still use [`PezhaiServer::shutdown`] followed by
+/// [`PezhaiServer::wait_stopped`].
 #[derive(Clone)]
 pub struct PezhaiServer {
+    shared: Arc<ServerShared>,
+}
+
+/// Shared handle-side state for the process-scoped server runtime.
+///
+/// This state keeps the public senders, lifecycle observation, and the
+/// best-effort "last handle dropped" shutdown signal in one ref-counted place
+/// so all `PezhaiServer` clones observe the same runtime.
+struct ServerShared {
     external_tx: mpsc::Sender<ExternalCall>,
     control_tx: mpsc::Sender<ControlMessage>,
     stopped: Arc<Notify>,
     lifecycle: Arc<AtomicU8>,
+    drop_shutdown_requested: Arc<AtomicBool>,
+    drop_shutdown_notify: Arc<Notify>,
+}
+
+impl ServerShared {
+    // Convert last-handle drop into the same asynchronous shutdown path the
+    // owner loop already uses for explicit teardown.
+    fn request_drop_shutdown(&self) {
+        if self.drop_shutdown_requested.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let previous = LifecycleState::from_u8(
+            self.lifecycle
+                .swap(LifecycleState::Stopping.as_u8(), Ordering::SeqCst),
+        );
+        if previous != LifecycleState::Stopped {
+            self.drop_shutdown_notify.notify_one();
+        }
+    }
+}
+
+impl Drop for PezhaiServer {
+    fn drop(&mut self) {
+        // The owner runtime lives on a detached OS thread, so the last handle
+        // must request shutdown explicitly instead of assuming ordinary drop
+        // of the mailbox senders will tear the runtime down.
+        if Arc::strong_count(&self.shared) == 1 {
+            self.shared.request_drop_shutdown();
+        }
+    }
 }
 
 impl std::fmt::Debug for PezhaiServer {
@@ -230,6 +293,8 @@ impl PezhaiServer {
         let (wal_result_tx, wal_result_rx) = mpsc::channel(maintenance.max_waiting_wal_syncs);
         let stopped = Arc::new(Notify::new());
         let lifecycle = Arc::new(AtomicU8::new(LifecycleState::Ready.as_u8()));
+        let drop_shutdown_requested = Arc::new(AtomicBool::new(false));
+        let drop_shutdown_notify = Arc::new(Notify::new());
         let runtime = OwnerRuntime::new(
             engine,
             external_rx,
@@ -240,7 +305,17 @@ impl PezhaiServer {
             wal_result_tx,
             Arc::clone(&stopped),
             Arc::clone(&lifecycle),
+            Arc::clone(&drop_shutdown_requested),
+            Arc::clone(&drop_shutdown_notify),
         );
+        let shared = Arc::new(ServerShared {
+            external_tx,
+            control_tx,
+            stopped,
+            lifecycle,
+            drop_shutdown_requested,
+            drop_shutdown_notify,
+        });
         std::thread::spawn(move || {
             let runtime_thread = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -251,12 +326,7 @@ impl PezhaiServer {
                 runtime.run().await;
             });
         });
-        Ok(Self {
-            external_tx,
-            control_tx,
-            stopped,
-            lifecycle,
-        })
+        Ok(Self { shared })
     }
 
     /// Submits one external logical request and awaits its terminal response.
@@ -271,11 +341,11 @@ impl PezhaiServer {
         &self,
         request: ExternalRequest,
     ) -> Result<ExternalResponse, KalanjiyamError> {
-        if let Some(response) = lifecycle_rejection(&self.lifecycle, &request) {
+        if let Some(response) = lifecycle_rejection(&self.shared.lifecycle, &request) {
             return Ok(response);
         }
         let (reply_tx, reply_rx) = oneshot::channel();
-        match self.external_tx.try_send(ExternalCall {
+        match self.shared.external_tx.try_send(ExternalCall {
             request: request.clone(),
             reply: reply_tx,
         }) {
@@ -289,7 +359,7 @@ impl PezhaiServer {
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 return Ok(lifecycle_error_response(
                     &request,
-                    LifecycleState::from_u8(self.lifecycle.load(Ordering::SeqCst)),
+                    LifecycleState::from_u8(self.shared.lifecycle.load(Ordering::SeqCst)),
                 ));
             }
         }
@@ -309,7 +379,8 @@ impl PezhaiServer {
     /// Space: O(c) for the cloned identifier plus one acknowledgment channel.
     pub async fn cancel(&self, client_id: &str, request_id: u64) -> Result<(), KalanjiyamError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.control_tx
+        self.shared
+            .control_tx
             .send(ControlMessage::Cancel {
                 client_id: client_id.to_string(),
                 request_id,
@@ -333,7 +404,8 @@ impl PezhaiServer {
     /// Space: O(c) for the cloned identifier plus one acknowledgment channel.
     pub async fn disconnect_client(&self, client_id: &str) -> Result<(), KalanjiyamError> {
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.control_tx
+        self.shared
+            .control_tx
             .send(ControlMessage::DisconnectClient {
                 client_id: client_id.to_string(),
                 ack: ack_tx,
@@ -349,20 +421,26 @@ impl PezhaiServer {
 
     /// Stops new admission and begins asynchronous shutdown.
     ///
+    /// This is the caller-visible way to request shutdown and observe whether
+    /// the owner loop accepted that request. Dropping the last handle also
+    /// requests shutdown, but drop cannot report completion.
+    ///
     /// # Complexity
     /// Time: O(1) to flip the lifecycle flag and enqueue one shutdown request.
     /// The await time depends on the owner loop finishing shutdown.
     /// Space: O(1) for the shutdown message and one acknowledgment channel.
     pub async fn shutdown(&self) -> Result<(), KalanjiyamError> {
         let previous = LifecycleState::from_u8(
-            self.lifecycle
+            self.shared
+                .lifecycle
                 .swap(LifecycleState::Stopping.as_u8(), Ordering::SeqCst),
         );
         if previous == LifecycleState::Stopped {
             return Ok(());
         }
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.control_tx
+        self.shared
+            .control_tx
             .send(ControlMessage::Shutdown { ack: ack_tx })
             .await
             .map_err(|_| KalanjiyamError::Io(std::io::Error::other("owner loop has stopped")))?;
@@ -375,16 +453,21 @@ impl PezhaiServer {
 
     /// Waits until the server has fully stopped.
     ///
+    /// Use this after [`PezhaiServer::shutdown`] when callers need a positive
+    /// confirmation that the owner runtime and its background threads have
+    /// exited.
+    ///
     /// # Complexity
     /// Time: O(1) to check the lifecycle flag. The await time depends on the
     /// owner runtime finishing shutdown and notifying waiters.
     /// Space: O(1).
     pub async fn wait_stopped(&self) -> Result<(), KalanjiyamError> {
-        if LifecycleState::from_u8(self.lifecycle.load(Ordering::SeqCst)) == LifecycleState::Stopped
+        if LifecycleState::from_u8(self.shared.lifecycle.load(Ordering::SeqCst))
+            == LifecycleState::Stopped
         {
             return Ok(());
         }
-        self.stopped.notified().await;
+        self.shared.stopped.notified().await;
         Ok(())
     }
 }
@@ -591,5 +674,92 @@ mod tests {
             ),
             Err(KalanjiyamError::InvalidArgument(_))
         ));
+    }
+
+    #[test]
+    fn dropping_last_handle_requests_detached_shutdown() {
+        let (external_tx, external_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        drop(external_rx);
+        drop(control_rx);
+        let shared = Arc::new(ServerShared {
+            external_tx,
+            control_tx,
+            stopped: Arc::new(Notify::new()),
+            lifecycle: Arc::new(AtomicU8::new(LifecycleState::Ready.as_u8())),
+            drop_shutdown_requested: Arc::new(AtomicBool::new(false)),
+            drop_shutdown_notify: Arc::new(Notify::new()),
+        });
+        let lifecycle = Arc::clone(&shared.lifecycle);
+        let drop_shutdown_requested = Arc::clone(&shared.drop_shutdown_requested);
+        let server = PezhaiServer {
+            shared: Arc::clone(&shared),
+        };
+        drop(shared);
+
+        drop(server);
+
+        assert!(drop_shutdown_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            LifecycleState::from_u8(lifecycle.load(Ordering::SeqCst)),
+            LifecycleState::Stopping
+        );
+    }
+
+    #[test]
+    fn dropping_non_last_clone_leaves_runtime_running() {
+        let (external_tx, external_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        drop(external_rx);
+        drop(control_rx);
+        let shared = Arc::new(ServerShared {
+            external_tx,
+            control_tx,
+            stopped: Arc::new(Notify::new()),
+            lifecycle: Arc::new(AtomicU8::new(LifecycleState::Ready.as_u8())),
+            drop_shutdown_requested: Arc::new(AtomicBool::new(false)),
+            drop_shutdown_notify: Arc::new(Notify::new()),
+        });
+        let lifecycle = Arc::clone(&shared.lifecycle);
+        let drop_shutdown_requested = Arc::clone(&shared.drop_shutdown_requested);
+        let server = PezhaiServer {
+            shared: Arc::clone(&shared),
+        };
+        let clone = server.clone();
+        drop(shared);
+
+        drop(clone);
+
+        assert!(!drop_shutdown_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            LifecycleState::from_u8(lifecycle.load(Ordering::SeqCst)),
+            LifecycleState::Ready
+        );
+        drop(server);
+    }
+
+    #[test]
+    fn duplicate_drop_shutdown_requests_are_ignored_after_the_first_signal() {
+        let (external_tx, external_rx) = mpsc::channel(1);
+        let (control_tx, control_rx) = mpsc::channel(1);
+        drop(external_rx);
+        drop(control_rx);
+        let shared = ServerShared {
+            external_tx,
+            control_tx,
+            stopped: Arc::new(Notify::new()),
+            lifecycle: Arc::new(AtomicU8::new(LifecycleState::Ready.as_u8())),
+            drop_shutdown_requested: Arc::new(AtomicBool::new(false)),
+            drop_shutdown_notify: Arc::new(Notify::new()),
+        };
+
+        shared.request_drop_shutdown();
+        shared.request_drop_shutdown();
+
+        assert!(shared.drop_shutdown_requested.load(Ordering::SeqCst));
+        assert_eq!(
+            LifecycleState::from_u8(shared.lifecycle.load(Ordering::SeqCst)),
+            LifecycleState::Stopping
+        );
     }
 }
