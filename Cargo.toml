@@ -13,3 +13,16 @@ path = "src/lib.rs"
 [[bin]]
 name = "kalanjiyam"
 path = "src/main.rs"
+
+[[bench]]
+name = "sevai_tcp_bench"
+harness = false
+
+[dependencies]
+buffa = "0.3.0" # Buffa runtime provides generated proto3 message types and zero-copy views.
+crc32c = "0.6.8" # Castagnoli CRC32C checksums required by the durable pezhai formats.
+tokio = { version = "1.50.0", features = ["io-util", "macros", "net", "rt", "sync", "time"] } # Async runtime, loopback TCP transport, and I/O helpers for the server and benchmark.
+toml = "1.1.0" # Semantic TOML parsing for config.toml validation.
+
+[dev-dependencies]
+tempfile = "3.27.0" # Temporary directories for engine and server integration tests.

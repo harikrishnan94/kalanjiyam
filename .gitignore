@@ -1,5 +1,6 @@
 # Rust build artifacts
 /target/
+/.cargo-target/
 **/*.rs.bk
 
 # Cargo lockfile backups and package artifacts
@@ -8,6 +9,9 @@
 # Rustup / rustc local metadata
 .rustup/
 .rustc_info.json
+
+# Repo-local Cargo home and registry cache
+/.cargo-home/
 
 # Editor settings: keep shared recommendations out unless added intentionally
 .vscode/*

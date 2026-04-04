@@ -1,26 +1,24 @@
-//! Library entry point for `kalanjiyam`.
-//!
-//! This crate intentionally exposes only a tiny amount of functionality.
-//! The goal is to keep a valid Rust library in place while the architecture,
-//! domain model, and distributed systems design are still being shaped.
+//! Library entry point for the pezhai storage engine and its in-process host.
 
-/// Returns the project name.
-pub fn project_name() -> &'static str {
-    "kalanjiyam"
+pub mod error;
+pub mod pezhai {
+    //! Engine-side modules for pezhai storage behavior and durable formats.
+
+    pub mod codec;
+    pub mod config;
+    pub mod durable;
+    pub mod engine;
+    pub mod types;
 }
+pub mod sevai;
 
-/// Returns a one-line statement of intent for the repository.
-pub fn intent() -> &'static str {
-    "A distributed ACID-compliant key-value store, to be built incrementally."
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{intent, project_name};
-
-    #[test]
-    fn project_identity_is_stable() {
-        assert_eq!(project_name(), "kalanjiyam");
-        assert!(intent().contains("ACID"));
-    }
-}
+pub use error::{Error, ErrorKind, KalanjiyamError};
+pub use pezhai::engine::PezhaiEngine;
+pub use pezhai::types::{
+    Bound, GetResponse, KeyRange, LevelStats, LogicalShardEntry, LogicalShardStats, ScanPage,
+    ScanRow, SnapshotHandle, StatsResponse, SyncMode, SyncResponse,
+};
+pub use sevai::{
+    ExternalMethod, ExternalRequest, ExternalResponse, ExternalResponsePayload, PezhaiServer,
+    ServerBootstrapArgs, Status, StatusCode,
+};
