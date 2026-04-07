@@ -1,0 +1,165 @@
+syntax = "proto3";
+
+package kalanjiyam.sevai.v1;
+
+// Empty marker message used by oneof variants that carry no payload.
+message Empty {}
+
+// External logical status code for the transport-facing RPC envelope.
+enum StatusCode {
+  STATUS_CODE_UNSPECIFIED = 0;
+  STATUS_CODE_OK = 1;
+  STATUS_CODE_BUSY = 2;
+  STATUS_CODE_INVALID_ARGUMENT = 3;
+  STATUS_CODE_IO = 4;
+  STATUS_CODE_CHECKSUM = 5;
+  STATUS_CODE_CORRUPTION = 6;
+  STATUS_CODE_STALE = 7;
+  STATUS_CODE_CANCELLED = 8;
+}
+
+// Transport-facing status payload mirrored from the server API.
+message Status {
+  StatusCode code = 1;
+  bool retryable = 2;
+  optional string message = 3;
+}
+
+// Inclusive or infinite range bound mirrored from the server API.
+message Bound {
+  oneof kind {
+    bytes finite = 1;
+    Empty neg_inf = 2;
+    Empty pos_inf = 3;
+  }
+}
+
+// `Put` request payload.
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// `Delete` request payload.
+message DeleteRequest {
+  bytes key = 1;
+}
+
+// `Get` request payload.
+message GetRequest {
+  bytes key = 1;
+}
+
+// `ScanStart` request payload.
+message ScanStartRequest {
+  Bound start_bound = 1;
+  Bound end_bound = 2;
+  uint32 max_records_per_page = 3;
+  uint32 max_bytes_per_page = 4;
+}
+
+// `ScanFetchNext` request payload.
+message ScanFetchNextRequest {
+  uint64 scan_id = 1;
+}
+
+// `Sync` request payload.
+message SyncRequest {}
+
+// `Stats` request payload.
+message StatsRequest {}
+
+// One transport request envelope.
+message RequestEnvelope {
+  string client_id = 1;
+  uint64 request_id = 2;
+  optional string cancel_token = 3;
+
+  oneof method {
+    PutRequest put = 10;
+    DeleteRequest delete = 11;
+    GetRequest get = 12;
+    ScanStartRequest scan_start = 13;
+    ScanFetchNextRequest scan_fetch_next = 14;
+    SyncRequest sync = 15;
+    StatsRequest stats = 16;
+  }
+}
+
+// `Put` success payload.
+message PutResponse {}
+
+// `Delete` success payload.
+message DeleteResponse {}
+
+// `Get` success payload.
+message GetResponse {
+  bool found = 1;
+  optional bytes value = 2;
+  uint64 observation_seqno = 3;
+  uint64 data_generation = 4;
+}
+
+// One row in one scan page.
+message ScanRow {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// `ScanStart` success payload.
+message ScanStartResponse {
+  uint64 scan_id = 1;
+  uint64 observation_seqno = 2;
+  uint64 data_generation = 3;
+}
+
+// `ScanFetchNext` success payload.
+message ScanFetchNextResponse {
+  repeated ScanRow rows = 1;
+  bool eof = 2;
+}
+
+// `Sync` success payload.
+message SyncResponse {
+  uint64 durable_seqno = 1;
+}
+
+// Level-wise shared-data stats entry.
+message LevelStats {
+  uint32 level_no = 1;
+  uint64 file_count = 2;
+  uint64 logical_bytes = 3;
+  uint64 physical_bytes = 4;
+}
+
+// Logical-shard stats entry.
+message LogicalShardStats {
+  Bound start_bound = 1;
+  Bound end_bound = 2;
+  uint64 live_size_bytes = 3;
+}
+
+// `Stats` success payload.
+message StatsResponse {
+  uint64 observation_seqno = 1;
+  uint64 data_generation = 2;
+  repeated LevelStats levels = 3;
+  repeated LogicalShardStats logical_shards = 4;
+}
+
+// One transport response envelope.
+message ResponseEnvelope {
+  string client_id = 1;
+  uint64 request_id = 2;
+  Status status = 3;
+
+  oneof payload {
+    PutResponse put = 10;
+    DeleteResponse delete = 11;
+    GetResponse get = 12;
+    ScanStartResponse scan_start = 13;
+    ScanFetchNextResponse scan_fetch_next = 14;
+    SyncResponse sync = 15;
+    StatsResponse stats = 16;
+  }
+}
