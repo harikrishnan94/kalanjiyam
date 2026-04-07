@@ -1,0 +1,17 @@
+[package]
+name = "pezhai"
+version = "0.1.0"
+edition = "2024"
+description = "Pezhai storage engine library and sevai runtime for kalanjiyam"
+license = "MIT"
+publish = false
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] } # Deserialize the shared TOML config.
+tokio = { version = "1.51.0", features = [
+    "macros",
+    "rt-multi-thread",
+    "sync",
+    "time",
+] } # Run the async server owner task and async test scaffolding.
+toml = "1.1.2" # Parse the semantic config.toml input used at startup.

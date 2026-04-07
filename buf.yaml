@@ -1,0 +1,3 @@
+version: v2
+modules:
+  - path: crates/pezhai-sevai/proto

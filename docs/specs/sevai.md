@@ -18,8 +18,8 @@ Source of truth:
 - `docs/specs/pezhai.md` remains authoritative for storage-engine state, snapshots,
   WAL,
   durable bytes, and engine error classes
-- this document is authoritative for server-thread ownership, asynchronous execution, logical RPC
-  method shapes, request ordering, cancellation, and backpressure
+- this document is authoritative for owner-actor ownership, service boundaries, asynchronous
+  execution, logical RPC method shapes, request ordering, cancellation, and backpressure
 - `docs/specs/tcp-rpc.md` is authoritative for the concrete proto3-over-TCP framing and
   binding used by this repository
 - pseudocode blocks labeled `Normative pseudocode` are authoritative for routing and state
@@ -47,17 +47,17 @@ Build an asynchronous in-process server around `Pezhai`. [BEHAVIORAL]
 
 The server owns one open `Pezhai` engine instance at a time. [BEHAVIORAL] It exposes a
 transport-agnostic external logical RPC surface for client-visible operations and a separate
-transport-agnostic internal logical RPC surface between the main thread and background worker
-threads. [BEHAVIORAL] Server open and close are tied to process lifetime rather than to external
-RPC. [BEHAVIORAL]
+transport-agnostic internal logical RPC surface between the owner actor and worker actors.
+[BEHAVIORAL] Server open and close are tied to process lifetime rather than to external RPC.
+[BEHAVIORAL]
 
-The server uses one main thread as the sole owner of mutable shared engine state. [BEHAVIORAL]
-Background workers are stateless across jobs and may keep only per-task scratch state while a task
+The server uses one owner actor as the sole owner of mutable shared engine state. [BEHAVIORAL]
+Worker actors are stateless across jobs and may keep only per-task scratch state while a task
 is running. [BEHAVIORAL]
-The main thread MUST invoke the engine's shared internal operation model for storage-engine
+The owner actor MUST invoke the engine's shared internal operation model for storage-engine
 operations instead of maintaining a separate server-only execution path for `put`, `delete`,
 `get`, `scan`, `sync`, `stats`, or internal snapshot commands. [BEHAVIORAL]
-The main thread MUST host the engine's mutable storage parts directly as ordinary owner-thread
+The owner actor MUST host the engine's mutable storage parts directly as ordinary owner-actor
 state, including at minimum `EngineState`, `WalSyncService`, and any pending WAL-reply
 bookkeeping, rather than routing through a second private synchronous core abstraction.
   [BEHAVIORAL]
@@ -70,10 +70,10 @@ logical-shard metadata.
 
 The core design goals are:
 
-- one-thread ownership of all shared mutable state [BEHAVIORAL]
+- single-owner serialized mutation of all shared mutable state [BEHAVIORAL]
 - external read and write RPCs that preserve the storage-engine semantics exactly [BEHAVIORAL]
-- delegation of arbitrarily complex or blocking work to background workers [BEHAVIORAL]
-- stateless workers that prepare results but never publish them directly [BEHAVIORAL]
+- delegation of arbitrarily complex or blocking work to worker actors [BEHAVIORAL]
+- stateless worker actors that prepare results but never publish them directly [BEHAVIORAL]
 - latest-only external reads while still using internal snapshots when a paged scan needs a stable
   view across multiple RPCs [BEHAVIORAL]
 - bounded queues, cancellation, and explicit backpressure under load [BEHAVIORAL]
@@ -82,7 +82,7 @@ The core design goals are:
 
 Success means:
 
-- the main thread ownership boundary is unambiguous [BEHAVIORAL]
+- the owner-actor boundary is unambiguous [BEHAVIORAL]
 - external RPC method shapes are defined without binding to TCP, HTTP, gRPC, or any byte-level
   transport [BEHAVIORAL]
 - internal RPC message types are defined exactly enough that independent implementations route work
@@ -96,7 +96,7 @@ Success means:
 - external `get` and external `scan` are latest-only [BEHAVIORAL]
 - internal `create_snapshot` and `release_snapshot` exist and are used by paged scans even though
   they are not externally exposed [BEHAVIORAL]
-- the main thread routes storage work through the engine-owned operation workflow instead of
+- the owner actor routes storage work through the engine-owned operation workflow instead of
   duplicating storage semantics in server-only helpers [BEHAVIORAL]
 - worker failures on behalf of one user request are surfaced externally as retryable server errors
   when appropriate, while recoverable background-maintenance failures are retried internally
@@ -106,18 +106,18 @@ Worked example:
 
 ```text
 Server process starts with --config /srv/pezhai/config.toml:
-  1. bootstrap code passes config_path to the main thread
-  2. main thread opens one engine instance before serving external RPCs
+  1. bootstrap code passes config_path to the owner actor
+  2. owner actor opens one engine instance before serving external RPCs
   3. external client issues scan_start(["ant", "yak"))
-  4. main thread validates the range
-  5. main thread creates one internal snapshot handle
-  6. main thread allocates one scan session
+  4. owner actor validates the range
+  5. owner actor creates one internal snapshot handle
+  6. owner actor allocates one scan session
   7. client A later calls scan_fetch_next(scan_id)
   8. client B may also call scan_fetch_next(scan_id)
-  9. main thread queues same-scan fetch requests and processes them one by one
+  9. owner actor queues same-scan fetch requests and processes them one by one
   10. worker reads frozen memtables and files for the pinned snapshot
-  11. main thread publishes the returned page into the session state
-  12. when EOF is reached, main thread releases the internal snapshot
+  11. owner actor publishes the returned page into the session state
+  12. when EOF is reached, owner actor releases the internal snapshot
 ```
 
 ASCII diagram:
@@ -127,7 +127,7 @@ external RPCs
       |
       v
 +--------------------+
-| main thread        |
+| owner actor        |
 | - owns all state   |
 | - validates        |
 | - fast in-memory   |
@@ -137,7 +137,7 @@ external RPCs
       |        |
       v        |
 +--------------------+
-| wal sync thread    |
+| WAL sync actor    |
 | - fsync batching   |
 | - owner-requested  |
 | - no publish       |
@@ -145,7 +145,7 @@ external RPCs
       |
       v
 +--------------------+
-| bgworker pool      |
+| worker actor pool   |
 | - read frozen/file |
 | - scan pages       |
 | - flush            |
@@ -158,12 +158,12 @@ Normative pseudocode:
 
 ```text
 function conceptual_server_rule(request):
-    main_thread_admits(request)
+    owner_actor_admits(request)
     if request.needs_blocking_or_complex_work:
-        dispatch_to_bgworker(request)
-        main_thread_validates_and_publishes(worker_result)
+        dispatch_to_worker_actor(request)
+        owner_actor_validates_and_publishes(worker_result)
     else:
-        main_thread_executes(request)
+        owner_actor_executes(request)
 ```
 
 ## 2. Scope
@@ -171,8 +171,8 @@ function conceptual_server_rule(request):
 ### 2.1 In scope
 
 - one open `Pezhai` engine instance per server process [BEHAVIORAL]
-- one main thread that owns all mutable shared state [BEHAVIORAL]
-- one or more stateless background worker threads [BEHAVIORAL]
+- one owner actor that owns all mutable shared state [BEHAVIORAL]
+- one or more stateless worker actors [BEHAVIORAL]
 - process startup that receives one configuration-file path as a command-line argument and opens the
   engine before serving requests [BEHAVIORAL]
 - transport-agnostic external logical RPC for `put`, `delete`, `get`, `scan`, `sync`, and `stats`
@@ -204,9 +204,9 @@ function conceptual_server_rule(request):
 
 ## 3. Core Invariants
 
-### 3.1 Main-thread ownership
+### 3.1 Owner-actor ownership
 
-The main thread is the sole owner of:
+The owner actor is the sole owner of:
 
 - engine open and ready state [BEHAVIORAL]
 - `engine_instance_id` and open-instance lifecycle [BEHAVIORAL]
@@ -221,7 +221,7 @@ The main thread is the sole owner of:
 
 ### 3.2 Worker restrictions
 
-Background workers:
+Worker actors:
 
 - MUST NOT mutate shared engine state directly [BEHAVIORAL]
 - MUST NOT publish a new manifest generation, logical-shard map, snapshot-table change, or WAL
@@ -230,25 +230,25 @@ Background workers:
   files [BEHAVIORAL]
 - MAY build temporary files, iterators, merge heaps, and scratch buffers that exist only for the
   lifetime of one task [BEHAVIORAL]
-- MUST return a result object that the main thread validates before making any shared state visible
+- MUST return a result object that the owner actor validates before making any shared state visible
   change [BEHAVIORAL]
 
 ### 3.3 Visibility and ordering rules
 
-- every externally visible write order is defined only by main-thread seqno assignment
+- every externally visible write order is defined only by owner-actor seqno assignment
   [BEHAVIORAL]
-- every externally visible metadata publish is defined only by a main-thread commit step
+- every externally visible metadata publish is defined only by an owner-actor commit step
   [BEHAVIORAL]
-- workers MAY complete tasks out of dispatch order, but the main thread MUST serialize publication
-  in a way that preserves engine semantics [BEHAVIORAL]
+- worker actors MAY complete tasks out of dispatch order, but the owner actor MUST serialize
+  publication in a way that preserves engine semantics [BEHAVIORAL]
 - a paged external scan MUST read one stable snapshot for its whole session even though the external
   API is latest-only [BEHAVIORAL]
-- `ScanFetchNext` requests for the same `scan_id` MAY arrive from arbitrary clients, but the main
-  thread MUST serialize them through one per-scan FIFO queue and process them one by one
+- `ScanFetchNext` requests for the same `scan_id` MAY arrive from arbitrary clients, but the owner
+  actor MUST serialize them through one per-scan FIFO queue and process them one by one
   [BEHAVIORAL]
-- the main thread MUST release any internal scan snapshot after EOF, whole-session cancellation,
+- the owner actor MUST release any internal scan snapshot after EOF, whole-session cancellation,
   session expiry, or shutdown cleanup [BEHAVIORAL]
-- before dispatching worker-side read work or registering durability waiters, the main thread MUST
+- before dispatching worker-side read work or registering durability waiters, the owner actor MUST
   ask the engine for one operation decision: complete immediately, execute one immutable read plan,
   or wait on one engine-owned WAL waiter [BEHAVIORAL]
 - the server MUST treat that engine decision as authoritative for storage semantics; it MAY still
@@ -265,21 +265,21 @@ Worked example:
 ```text
 Compaction worker finishes before an older flush worker:
   compaction result is not auto-published
-  main thread validates its input-generation preconditions
-  if stale, main thread rejects it without changing visible state
+  owner actor validates its input-generation preconditions
+  if stale, owner actor rejects it without changing visible state
 ```
 
 ASCII diagram:
 
 ```text
-worker result -> main thread validation -> publish or reject
+worker result -> owner actor validation -> publish or reject
 ```
 
 Normative pseudocode:
 
 ```text
 function publish_rule(state, result):
-    assert current_thread == main_thread
+    assert current_actor == owner_actor
     if violates_current_preconditions(state, result):
         return Err(Stale)
     apply_visible_state_change(state, result)
@@ -288,25 +288,28 @@ function publish_rule(state, result):
 
 ## 4. Server Architecture
 
-### 4.1 Thread roles
+### 4.1 Actor roles
 
-The server has two execution roles:
+The server has three execution roles:
 
-- `main thread`:
+- `owner actor`:
   receives bootstrap input and all external RPCs, enforces per-client ordering, performs
   validation, runs lightweight in-memory work, appends WAL records, updates the active memtable,
   allocates snapshots and scan sessions, manages per-scan fetch queues, dispatches background
   tasks, validates worker results, and publishes all shared-state mutations [BEHAVIORAL]
-- `bgworker`:
+- `worker actor pool`:
   executes blocking or arbitrarily complex tasks on immutable inputs and returns logical results
   only [BEHAVIORAL]
+- `WAL sync actor`:
+  performs durable-frontier advancement work over already-appended WAL bytes and reports
+  completion back to the owner actor without publishing durability state directly [BEHAVIORAL]
 
 ### 4.2 Lightweight versus delegated work
 
-The main thread MUST directly handle only work whose latency and complexity are bounded by small
-in-memory operations over main-thread-owned state. [BEHAVIORAL]
+The owner actor MUST directly handle only work whose latency and complexity are bounded by small
+in-memory operations over owner-actor state. [BEHAVIORAL]
 
-Examples of main-thread work:
+Examples of owner-actor work:
 
 - startup config-path validation and engine-open checks [BEHAVIORAL]
 - logical-shard metadata lookup [BEHAVIORAL]
@@ -342,7 +345,7 @@ ServerBootstrapArgs {
 Rules:
 
 - `config_path` MUST be passed to the server process as a command-line argument [BEHAVIORAL]
-- during startup, the main thread MUST call storage-engine `open(config_path)` before the server is
+- during startup, the owner actor MUST call storage-engine `open(config_path)` before the server is
   considered ready [BEHAVIORAL]
 - in the Rust binding, `start(args)`, `call(request)`, `shutdown()`, and `wait_stopped()` are
   asynchronous control-plane methods; they MUST preserve the lifecycle rules in this section
@@ -355,7 +358,7 @@ Rules:
 - server shutdown MUST stop new request admission before releasing scan sessions, worker waiters,
   and the owned engine instance [BEHAVIORAL]
 - dropping the last live Rust `PezhaiServer` handle MUST request the same internal shutdown
-  cleanup path used by `shutdown()` so detached owner-runtime threads do not outlive the process
+  cleanup path used by `shutdown()` so detached owner-runtime tasks do not outlive the process
   host indefinitely [BEHAVIORAL]
 - because handle drop cannot await completion, callers that need confirmation MUST still use
   `shutdown()` followed by `wait_stopped()` [BEHAVIORAL]
@@ -367,7 +370,7 @@ argv[--config <path>]
         |
         v
 +---------------------------+
-| bootstrap / main thread   |
+| bootstrap / owner actor   |
 | validate config_path      |
 | open_engine(config_path)  |
 +---------------------------+
@@ -398,9 +401,9 @@ Rules:
 
 - external logical RPCs are asynchronous request/response interactions identified by
   `client_id` plus `request_id`, not synchronous function-call assumptions [BEHAVIORAL]
-- internal communication between the main thread and background workers MUST be modeled as
-  asynchronous message passing plus later completion on the main thread [BEHAVIORAL]
-- the main thread MAY complete a request immediately, queue it behind earlier work, or hold it
+- internal communication between the owner actor and worker actors MUST be modeled as
+  asynchronous message passing plus later completion on the owner actor [BEHAVIORAL]
+- the owner actor MAY complete a request immediately, queue it behind earlier work, or hold it
   pending on worker completion as long as logical ordering rules are preserved [BEHAVIORAL]
 - `ScanFetchNext` is the canonical externally visible queued operation: same-scan requests may wait
   in a server-owned queue and complete later in FIFO order [BEHAVIORAL]
@@ -450,19 +453,19 @@ External request
     |
     +--> Admitted
           |
-          +--> CompletedOnMainThread
+          +--> CompletedInOwnerActor
           |
           +--> QueuedInScanSession
           |     |
           |     +--> ActiveScanFetch
           |           |
-          |           +--> CompletedOnMainThread
+          |           +--> CompletedInOwnerActor
           |           |
           |           +--> WaitingForWorkerResult
           |
           +--> WaitingForWorkerResult
                     |
-                    +--> MainThreadPublishOrReject
+                    +--> OwnerActorPublishOrReject
                               |
                               +--> ReplySuccess
                               |
@@ -502,12 +505,12 @@ ASCII diagram:
 
 ```text
 client A fetch(scan_id) --\
-client B fetch(scan_id) ----> main thread -> session.fetch_request_queue
+client B fetch(scan_id) ----> owner actor -> session.fetch_request_queue
 client C fetch(scan_id) --/                    |
                                                v
                                     dequeue one request
                                                |
-                                  main-thread page or worker task
+                                  owner-actor page generation or worker task
                                                |
                                   update resume_after_key / eof
                                                |
@@ -615,10 +618,10 @@ Rules:
 - `Put` MUST preserve the `put()` semantics defined in
   `docs/specs/pezhai.md`
   [BEHAVIORAL]
-- the main thread MUST validate the key and value, append the WAL record, update the active
+- the owner actor MUST validate the key and value, append the WAL record, update the active
   memtable, and assign visibility in that order [BEHAVIORAL]
-- if the configured sync mode requires durability before acknowledgement, the main thread MAY wait
-  on a background `WalSyncTask`, but it MUST NOT acknowledge success before the required durable
+- if the configured sync mode requires durability before acknowledgement, the owner actor MAY wait
+  on the `WAL sync actor`, but it MUST NOT acknowledge success before the required durable
   frontier is reached [BEHAVIORAL]
 
 ### 5.5 `Delete`
@@ -642,7 +645,7 @@ Rules:
 - `Delete` MUST preserve the `delete()` semantics defined in
   `docs/specs/pezhai.md`
   [BEHAVIORAL]
-- the main thread MUST validate the key, append the WAL record, and insert the tombstone into the
+- the owner actor MUST validate the key, append the WAL record, and insert the tombstone into the
   active memtable before returning success [BEHAVIORAL]
 - if the configured sync mode requires durability before acknowledgement, the same `Put` durability
   rule applies [BEHAVIORAL]
@@ -671,12 +674,12 @@ GetResponse {
 Rules:
 
 - external `Get` is latest-only and MUST NOT accept an explicit snapshot handle [BEHAVIORAL]
-- the main thread MUST resolve the implicit read snapshot at request admission using current
+- the owner actor MUST resolve the implicit read snapshot at request admission using current
   `last_committed_seqno` and current `data_generation` [BEHAVIORAL]
-- the main thread MUST first probe the active memtable for the key [BEHAVIORAL]
-- if the active memtable contains the first visible result, the main thread MUST answer without a
+- the owner actor MUST first probe the active memtable for the key [BEHAVIORAL]
+- if the active memtable contains the first visible result, the owner actor MUST answer without a
   worker hop [BEHAVIORAL]
-- otherwise the main thread MUST dispatch a `GetTask` with the pinned snapshot and immutable source
+- otherwise the owner actor MUST dispatch a `GetTask` with the pinned snapshot and immutable source
   references taken from that generation [BEHAVIORAL]
 - the response MUST include the resolved `observation_seqno` and `data_generation`
   [BEHAVIORAL]
@@ -710,13 +713,13 @@ Rules:
   [BEHAVIORAL]
 - `ScanStart` is the external projection of storage-engine `scan()` into a paged RPC protocol
   [BEHAVIORAL]
-- the main thread MUST validate the range and page limits [BEHAVIORAL]
+- the owner actor MUST validate the range and page limits [BEHAVIORAL]
 - `start_bound` MUST be `NegInf` or `Finite`, `end_bound` MUST be `Finite` or `PosInf`, and the
   half-open range `[start_bound, end_bound)` MUST be non-empty under `compare_bound(...)`;
   otherwise `ScanStart` MUST fail with `InvalidArgument` [BEHAVIORAL]
 - `max_records_per_page` and `max_bytes_per_page` MUST both be greater than zero; otherwise
   `ScanStart` MUST fail with `InvalidArgument` [BEHAVIORAL]
-- the main thread MUST create one internal snapshot handle and one scan session before returning
+- the owner actor MUST create one internal snapshot handle and one scan session before returning
   success [BEHAVIORAL]
 - the scan session MUST pin exactly one `snapshot_seqno` and one `data_generation` for the full
   lifetime of the session [BEHAVIORAL]
@@ -748,27 +751,27 @@ Rules:
 - `ScanFetchNext` MUST read from the scan session created by `ScanStart` [BEHAVIORAL]
 - `ScanFetchNext` for one `scan_id` MAY be issued by arbitrary clients that know the `scan_id`
   [BEHAVIORAL]
-- the main thread MUST allow at most one active page-production step per `scan_id`
+- the owner actor MUST allow at most one active page-production step per `scan_id`
   [BEHAVIORAL]
 - if additional `ScanFetchNext` requests for the same `scan_id` arrive while one request is active,
-  the main thread MUST enqueue them in the scan session's FIFO fetch queue instead of returning
+  the owner actor MUST enqueue them in the scan session's FIFO fetch queue instead of returning
   `Busy` solely for that reason [BEHAVIORAL]
 - queued `ScanFetchNext` requests for the same `scan_id` MUST be processed one by one in queue
   order [BEHAVIORAL]
-- if one page can be produced from the pinned active memtable alone, the main thread MAY answer
+- if one page can be produced from the pinned active memtable alone, the owner actor MAY answer
   the active queued `ScanFetchNext` directly without worker dispatch [BEHAVIORAL]
-- otherwise the main thread MUST dispatch a `ScanPageTask` that uses the session's internal
+- otherwise the owner actor MUST dispatch a `ScanPageTask` that uses the session's internal
   snapshot handle and pinned manifest generation [BEHAVIORAL]
 - every successful non-EOF `ScanFetchNext` response MUST contain at least one row; if the first
   remaining visible row alone exceeds `max_bytes_per_page`, the server MUST return that row as a
   single-row page and MAY exceed the byte limit for that response so the scan still makes forward
   progress [BEHAVIORAL]
-- completion of one `ScanFetchNext` MUST update `resume_after_key` before the main thread begins
+- completion of one `ScanFetchNext` MUST update `resume_after_key` before the owner actor begins
   the next queued fetch for that `scan_id` [BEHAVIORAL]
 - if EOF closes a scan session while later `ScanFetchNext` requests remain queued for that
-  `scan_id`, the main thread MUST fail those queued requests before deleting the session
+  `scan_id`, the owner actor MUST fail those queued requests before deleting the session
   [BEHAVIORAL]
-- when `eof = true`, the main thread MUST release the internal snapshot handle and delete the scan
+- when `eof = true`, the owner actor MUST release the internal snapshot handle and delete the scan
   session before replying success [BEHAVIORAL]
 
 ### 5.9 `Sync`
@@ -790,15 +793,15 @@ SyncResponse {
 Rules:
 
 - `Sync` MUST preserve the storage-engine `sync()` semantics [BEHAVIORAL]
-- the main thread MUST translate `Sync` into one durability target on the current WAL append
+- the owner actor MUST translate `Sync` into one durability target on the current WAL append
   frontier [BEHAVIORAL]
 - `SyncResponse.durable_seqno` MUST be the greatest committed seqno whose WAL record is guaranteed
   durable at reply time; if no committed seqno is yet durable, it MUST be `0` [BEHAVIORAL]
 - the blocking durable-frontier advancement work MUST execute on the engine-owned dedicated WAL
-  sync thread, not through the generic worker pool [BEHAVIORAL]
+  sync actor, not through the generic worker actor pool [BEHAVIORAL]
 - multiple waiting writes and explicit `Sync` requests MAY share one group-commit batch when their
   required durable frontier overlaps [BEHAVIORAL]
-- if the current durable frontier already covers the requested seqno, the main thread MUST reply
+- if the current durable frontier already covers the requested seqno, the owner actor MUST reply
   immediately without dispatching new WAL sync work [BEHAVIORAL]
 
 ### 5.10 `Stats`
@@ -823,7 +826,7 @@ StatsResponse {
 Rules:
 
 - `Stats` MUST preserve the storage-engine `stats()` semantics [BEHAVIORAL]
-- the main thread MUST answer `Stats` directly from current owned state [BEHAVIORAL]
+- the owner actor MUST answer `Stats` directly from current owned state [BEHAVIORAL]
 - `Stats` MUST report the latest current logical-shard map, not a historical read snapshot
   [BEHAVIORAL]
 
@@ -846,9 +849,9 @@ Internal responses contain:
 - `status` [BEHAVIORAL]
 - `payload`: one exact result type defined below when `status.code = Ok` [BEHAVIORAL]
 
-### 6.2 Main-thread internal commands
+### 6.2 Owner-actor internal commands
 
-The main thread accepts these internal control commands:
+The owner actor accepts these internal control commands:
 
 - `CreateSnapshotCmd`
 - `ReleaseSnapshotCmd`
@@ -879,7 +882,7 @@ CancelTaskResult {}
 
 Rules:
 
-- `CreateSnapshotCmd` and `ReleaseSnapshotCmd` execute on the main thread only [BEHAVIORAL]
+- `CreateSnapshotCmd` and `ReleaseSnapshotCmd` execute on the owner actor only [BEHAVIORAL]
 - `CreateSnapshotCmd` and `ReleaseSnapshotCmd` MUST preserve the storage-engine
   `create_snapshot()` and `release_snapshot()` semantics exactly [BEHAVIORAL]
 - `CancelTaskCmd` marks queued work cancelled immediately and marks running work cancelled on a
@@ -954,7 +957,7 @@ Rules:
 - `ScanPageTaskResult.next_resume_after_key` MUST be the greatest emitted key of the page when
   `eof = false` [BEHAVIORAL]
 
-#### 6.3.3 Dedicated WAL sync thread
+#### 6.3.3 Dedicated WAL sync actor
 
 ```text
 WalSyncRequest {
@@ -972,12 +975,12 @@ WalSyncBatchResult {
 
 Rules:
 
-- the dedicated WAL sync thread advances durability only for bytes already appended by the main
-  thread [BEHAVIORAL]
-- the dedicated WAL sync thread MUST NOT change the WAL append cursor, seqno allocator, rollover
+- the dedicated WAL sync actor advances durability only for bytes already appended by the owner
+  actor [BEHAVIORAL]
+- the dedicated WAL sync actor MUST NOT change the WAL append cursor, seqno allocator, rollover
   state, or published durable frontier directly [BEHAVIORAL]
-- the main thread remains responsible for durable-frontier publication and waiter release after one
-  sync-thread result is received [BEHAVIORAL]
+- the owner actor remains responsible for durable-frontier publication and waiter release after one
+  WAL sync actor result is received [BEHAVIORAL]
 
 #### 6.3.4 `FlushTask`
 
@@ -1002,7 +1005,7 @@ Rules:
 - the captured task input MUST identify one immutable frozen-memtable source without borrowing the
   live mutable engine state; implementations MAY satisfy that by sharing one immutable reference or
   by any equivalent immutable handle [BEHAVIORAL]
-- the main thread MUST validate `source_generation` and `source_frozen_memtable_id` before
+- the owner actor MUST validate `source_generation` and `source_frozen_memtable_id` before
   publication [BEHAVIORAL]
 
 #### 6.3.5 `CompactTask`
@@ -1025,7 +1028,7 @@ CompactTaskResult {
 Rules:
 
 - `CompactTask` prepares replacement output files for one exact input set [BEHAVIORAL]
-- the main thread MUST validate the exact input file set against the current generation before
+- the owner actor MUST validate the exact input file set against the current generation before
   publication [BEHAVIORAL]
 
 #### 6.3.6 `CheckpointTask`
@@ -1046,7 +1049,7 @@ CheckpointTaskResult {
 Rules:
 
 - `CheckpointTask` prepares durable checkpoint artifacts only [BEHAVIORAL]
-- `CURRENT` update or other publication steps remain main-thread work [BEHAVIORAL]
+- `CURRENT` update or other publication steps remain owner-actor work [BEHAVIORAL]
 
 #### 6.3.7 `GcTask`
 
@@ -1062,7 +1065,7 @@ GcTaskResult {
 
 Rules:
 
-- `GcTask` MUST operate only on files the main thread has already marked safe to delete
+- `GcTask` MUST operate only on files the owner actor has already marked safe to delete
   [BEHAVIORAL]
 - failure to delete one file MUST NOT mutate shared visibility state [BEHAVIORAL]
 
@@ -1070,7 +1073,7 @@ Rules:
 
 ### 7.1 External request admission
 
-- the main thread MUST admit or reject every external request [BEHAVIORAL]
+- the owner actor MUST admit or reject every external request [BEHAVIORAL]
 - the server MUST NOT admit external requests until startup open has succeeded and the server is in
   `Ready` state [BEHAVIORAL]
 - if the server is not in `Ready` state, every external method MUST fail before worker dispatch
@@ -1127,9 +1130,9 @@ Rules:
   [BEHAVIORAL]
 - `ScanFetchNext` MUST dispatch work against the session-pinned snapshot, not the latest current
   state [BEHAVIORAL]
-- `ScanFetchNext` requests for one `scan_id` MUST be enqueued and serialized by the main thread
+- `ScanFetchNext` requests for one `scan_id` MUST be enqueued and serialized by the owner actor
   even when they arrive from different clients [BEHAVIORAL]
-- `ScanFetchNext` MAY complete on the main thread when the pinned generation can satisfy the page
+- `ScanFetchNext` MAY complete on the owner actor when the pinned generation can satisfy the page
   from the active memtable alone [BEHAVIORAL]
 
 Normative pseudocode:
@@ -1209,33 +1212,33 @@ finish_scan_fetch_request(state, session, page_or_worker_result):
 
 Rules:
 
-- the main thread MUST register one waiter keyed by durable seqno frontier, not by one permanent
+- the owner actor MUST register one waiter keyed by durable seqno frontier, not by one permanent
   segment identity [BEHAVIORAL]
 - if the current durable frontier already covers the target seqno, the request MUST complete
   immediately without new dispatch [BEHAVIORAL]
 - the server MUST use the engine-owned `sync` operation path to create or complete the waiter; it
   MUST NOT keep a separate server-only sync-target planner [BEHAVIORAL]
-- otherwise the main thread MUST issue one request to the dedicated WAL sync thread and wait for a
+- otherwise the owner actor MUST issue one request to the dedicated WAL sync actor and wait for a
   returned frontier that covers the request [BEHAVIORAL]
-- multiple waiting writes and explicit `Sync` requests MAY share one sync-thread batch when their
+- multiple waiting writes and explicit `Sync` requests MAY share one WAL sync actor batch when their
   required durable frontier overlaps [BEHAVIORAL]
-- the sync thread MUST flush when either the unsynced bytes since the last published durable
+- the WAL sync actor MUST flush when either the unsynced bytes since the last published durable
   frontier reach `wal.group_commit_bytes`, or the oldest pending waiter reaches
   `wal.group_commit_max_delay_ms`, whichever happens first [BEHAVIORAL]
-- when the sync thread returns success, the main thread MUST advance the durable frontier and
+- when the WAL sync actor returns success, the owner actor MUST advance the durable frontier and
   release all satisfied waiters [BEHAVIORAL]
 
 ### 7.5 Write routing
 
 Rules:
 
-- `Put` and `Delete` MUST allocate seqnos and append WAL records on the main thread
+- `Put` and `Delete` MUST allocate seqnos and append WAL records on the owner actor
   [BEHAVIORAL]
-- the main thread MUST update the active memtable before returning success [BEHAVIORAL]
-- in `PerWrite` mode, the main thread MUST register a durability waiter after the WAL append and
-  MUST acknowledge only after the dedicated WAL sync thread reports a covering durable frontier
+- the owner actor MUST update the active memtable before returning success [BEHAVIORAL]
+- in `PerWrite` mode, the owner actor MUST register a durability waiter after the WAL append and
+  MUST acknowledge only after the dedicated WAL sync actor reports a covering durable frontier
   [BEHAVIORAL]
-- if thresholds are crossed, the main thread MAY freeze the active memtable and enqueue background
+- if thresholds are crossed, the owner actor MAY freeze the active memtable and enqueue background
   maintenance after the write becomes visible [BEHAVIORAL]
 
 ## 8. Background Maintenance
@@ -1249,33 +1252,33 @@ Automatic maintenance includes:
 - checkpoint creation [BEHAVIORAL]
 - garbage collection [BEHAVIORAL]
 
-The main thread decides when to dispatch these tasks. [BEHAVIORAL]
+The owner actor decides when to dispatch these tasks. [BEHAVIORAL]
 
 ### 8.2 Publication rules
 
 Rules:
 
-- a worker-prepared flush result MUST return to the main thread as `FlushTaskResult`
+- a worker-prepared flush result MUST return to the owner actor as `FlushTaskResult`
   [BEHAVIORAL]
-- a worker-prepared compaction result MUST return to the main thread as `CompactTaskResult`
+- a worker-prepared compaction result MUST return to the owner actor as `CompactTaskResult`
   [BEHAVIORAL]
-- the main thread MUST append any required publish WAL record before installing the new visible
+- the owner actor MUST append any required publish WAL record before installing the new visible
   generation [BEHAVIORAL]
-- the main thread MUST reject stale maintenance results using the same source-generation or exact
+- the owner actor MUST reject stale maintenance results using the same source-generation or exact
   input-set checks required by the storage-engine specification [BEHAVIORAL]
 
 ### 8.3 Retry rules
 
 - recoverable worker `IO` during externally visible `Get` or `ScanFetchNext` MUST be returned to
   the caller with `status.code = IO` and `status.retryable = true` [BEHAVIORAL]
-- WAL sync-thread `IO` for one in-flight batch MUST fail every affected waiter in that batch and
+- WAL sync actor `IO` for one in-flight batch MUST fail every affected waiter in that batch and
   MUST place the live engine instance into the same write-stopped state used for fatal append-path
   failure until the next successful restart [BEHAVIORAL]
 - recoverable worker `IO` during automatic flush, compaction, checkpoint, or garbage collection
   MUST be retried internally with bounded backoff and MUST NOT surface as an external admin RPC
   failure because no such external admin RPC exists in v1 [BEHAVIORAL]
 - if a live append-path `IO` forces the engine into a write-stopped state under the storage-engine
-  rules, the main thread MUST stop admitting new writes until the next successful server restart
+  rules, the owner actor MUST stop admitting new writes until the next successful server restart
   that reopens the engine [BEHAVIORAL]
 
 Worked example:
@@ -1283,8 +1286,8 @@ Worked example:
 ```text
 Background compaction hits one transient read IO:
   worker returns IO
-  main thread records the attempt
-  main thread schedules a retry later
+  owner actor records the attempt
+  owner actor schedules a retry later
   no external client sees a compaction RPC failure
 ```
 
@@ -1323,7 +1326,7 @@ Rules:
   the internal operation MUST run to its normal publish or completion point [BEHAVIORAL]
 - `Put` and `Delete` durability waiters MUST NOT be cancelled after the WAL append that defines the
   visible write seqno has completed [BEHAVIORAL]
-- if a client disconnects, the main thread MUST cancel that client's queued tasks and queued
+- if a client disconnects, the owner actor MUST cancel that client's queued tasks and queued
   external requests immediately, and MUST best-effort cancel that client's active external requests
   only when they have not yet crossed an externally visible or durability-relevant point
   [BEHAVIORAL]
@@ -1347,7 +1350,7 @@ The server MUST enforce finite implementation-defined limits for:
 
 Rules:
 
-- if admitting one request would exceed a relevant limit, the main thread MUST reject it with
+- if admitting one request would exceed a relevant limit, the owner actor MUST reject it with
   `Busy` before mutating visible state [BEHAVIORAL]
 - limits MAY differ by method type [BEHAVIORAL]
 - `ScanStart` SHOULD be rejected before snapshot creation if the scan-session table is full
@@ -1386,11 +1389,11 @@ Rules:
 
 An implementation conforms to this specification only if all of the following hold:
 
-1. all shared mutable engine state is mutated only by the main thread [BEHAVIORAL]
+1. all shared mutable engine state is mutated only by the owner actor [BEHAVIORAL]
 2. server startup takes one configuration-file path from the command line, opens the engine before
    serving requests, and exposes no external `Open` or `Close` RPC [BEHAVIORAL]
-3. external `Get` resolves latest-only reads and can complete on the main thread for active-
-   memtable hits [BEHAVIORAL]
+3. external `Get` resolves latest-only reads and can complete within the owner actor for active-
+   memtable hits without worker dispatch [BEHAVIORAL]
 4. external `Get` delegates to `GetTask` when frozen memtables or files are needed [BEHAVIORAL]
 5. external `ScanStart` creates one internal snapshot and external `ScanFetchNext` reuses it for
    the full scan session [BEHAVIORAL]
@@ -1398,15 +1401,15 @@ An implementation conforms to this specification only if all of the following ho
    even when they arrive from arbitrary clients [BEHAVIORAL]
 7. external scan sessions release their internal snapshot on EOF, cancellation, expiry, and server
    shutdown cleanup [BEHAVIORAL]
-8. workers never publish flush, compaction, checkpoint, WAL durable-frontier, or metadata changes
-   directly [BEHAVIORAL]
+8. worker actors never publish flush, compaction, checkpoint, WAL durable-frontier, or metadata
+   changes directly [BEHAVIORAL]
 9. `Put` and `Delete` acknowledgement obey the configured sync-mode durability rules
    [BEHAVIORAL]
 10. recoverable worker `IO` for user-visible reads or sync is surfaced externally as retryable
    `IO` [BEHAVIORAL]
 11. recoverable worker `IO` for automatic maintenance is retried internally [BEHAVIORAL]
 12. bounded queues cause admission-time `Busy` rather than unbounded growth [BEHAVIORAL]
-13. per-client request ordering is enforced by the main thread while same-scan fetch ordering is
+13. per-client request ordering is enforced by the owner actor while same-scan fetch ordering is
     enforced by per-scan queues [BEHAVIORAL]
 
 Required test categories:
@@ -1421,6 +1424,6 @@ Required test categories:
 - scan expiry or shutdown cleanup releases the internal snapshot
 - worker `FlushTaskResult` is rejected as `Stale` when source generation changes before publish
 - worker `CompactTaskResult` is rejected as `Stale` when exact input files no longer match
-- shared `WalSyncTask` satisfies multiple waiters
+- one shared WAL sync actor batch satisfies multiple waiters
 - backpressure rejects requests with `Busy` before state mutation
 - client disconnect cancels that client's queued work without destroying a shared scan session

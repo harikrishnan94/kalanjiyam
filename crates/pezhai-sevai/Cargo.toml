@@ -1,0 +1,23 @@
+[package]
+name = "pezhai-sevai"
+version = "0.1.0"
+edition = "2024"
+description = "Thin server binary for the Pezhai sevai runtime"
+license = "MIT"
+publish = false
+
+[dependencies]
+buffa = "0.3.0" # Encode and decode framed protobuf request and response envelopes.
+pezhai = { path = "../pezhai" } # Reuse the shared Pezhai sevai runtime library.
+tokio = { version = "1.51.0", features = [
+    "io-util",
+    "macros",
+    "net",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] } # Drive the async binary entrypoint, TCP adapter, and shutdown handling.
+
+[build-dependencies]
+buffa-build = "0.3.0" # Generate Rust types from crates/pezhai-sevai/proto/sevai.proto.

@@ -508,6 +508,34 @@ Rules:
 - config changes are reopen-only [BEHAVIORAL]
 - there is no live config mutation API in v1 [BEHAVIORAL]
 
+### 5.4 `[sevai]`
+
+The `[sevai]` table captures the server-side bootstrap settings required by the
+transport layer that wraps `Pezhai`. The table is required for every
+process that opens the server regardless of whether the storage engine uses the
+fields immediately.
+
+Rules:
+
+- the table MUST exist in the `config.toml` file passed to `PezhaiServer`
+  startup [BEHAVIORAL]
+- `listen_addr` is required, must be a TOML string containing a valid TCP
+  bind address, and MUST describe the endpoint where the TCP adapter listens for
+  framed RPC traffic [BEHAVIORAL]
+- both IPv4 and IPv6 address literals are acceptable; the server MUST follow
+  the usual SocketAddr parsing rules when resolving the string [BEHAVIORAL]
+
+Example:
+
+```toml
+[sevai]
+listen_addr = "127.0.0.1:9000"
+```
+
+The bootstrap code MUST read `[sevai].listen_addr` before opening the TCP
+listener described in `docs/specs/tcp-rpc.md`, so this field determines whether
+startup succeeds or fails even before any storage-engine operations occur.
+
 ## 6. Data and State Model
 
 ### 6.1 Keys and logical ranges
@@ -1605,10 +1633,13 @@ function validate_logical_shard_install_payload(payload):
 WAL append exists to impose one durable total order on mutations, shared-data publishes, and
 logical metadata installs.
 
+In this section, `owner path` means the engine's single serialized mutation path, regardless of
+which runtime task or OS thread is currently executing it.
+
 Rules:
 
 - every live append allocates exactly one seqno before any durable bytes for that record are written
-- the owner thread MUST append records in seqno order
+- the owner path MUST append records in seqno order
 - if the active segment lacks room for the next full aligned record plus a footer, the engine MUST:
   1. write the current segment footer
   2. fsync the current segment
@@ -2382,7 +2413,7 @@ function put(state, key, value):
 
 Complexity:
 
-- `put()` is `Theta(|key| + |value| + log K_mem + log V_key)` owner-thread time and
+- `put()` is `Theta(|key| + |value| + log K_mem + log V_key)` owner-path time and
   `Theta(1 + I_new)` extra RAM beyond the inserted memtable record, where `K_mem` is the active
   memtable's distinct-key count, `V_key` is the version count already stored for `key`, and
   `I_new` is `|key|` when the write creates one new per-key index entry and `1` otherwise
@@ -2430,7 +2461,7 @@ function delete(state, key):
 
 Complexity:
 
-- `delete()` is `Theta(|key| + log K_mem + log V_key)` owner-thread time and
+- `delete()` is `Theta(|key| + log K_mem + log V_key)` owner-path time and
   `Theta(1 + I_new)` extra RAM beyond the inserted memtable record, where `K_mem`, `V_key`, and
   `I_new` are defined as in `put()`
 - in `PerWrite` mode, acknowledgement MUST wait until the durable frontier covers the tombstone
@@ -2600,7 +2631,7 @@ function sync(state):
 
 Complexity:
 
-- `sync()` is `Theta(1)` owner-thread work plus up to one shared WAL fsync for its batch
+- `sync()` is `Theta(1)` owner-path work plus up to one shared WAL fsync for its batch
 
 ### 9.9 `stats()` (`FR-STATS`)
 
@@ -2774,9 +2805,9 @@ files.
 
 Rules:
 
-- the owner thread MAY attempt split or merge work under any implementation-defined scheduling or
+- the owner path MAY attempt split or merge work under any implementation-defined scheduling or
   triggering policy
-- the owner thread MAY recompute exact `live_size_bytes` for candidate source or output entries,
+- the owner path MAY recompute exact `live_size_bytes` for candidate source or output entries,
   but v1 does not require exact live-byte accounting for correctness
 - a split MUST replace exactly one current logical-shard entry with exactly two contiguous output
   entries that preserve the same outer bounds
@@ -2882,7 +2913,7 @@ Behavior:
 3. freeze the active memtable if it is non-empty
 4. wait until every current frozen memtable is flushed and its publish is accepted
 5. assert that the current generation has zero frozen memtables and an empty active memtable
-6. enter a checkpoint-capture pause before any new seqno-allocating owner-thread operation changes
+6. enter a checkpoint-capture pause before any new seqno-allocating owner-path operation changes
    the visible shared data state or the current logical-shard map
 7. let `S_cp = last_committed_seqno`
 8. capture the current shared data manifest, current logical-shard map, and allocator state exactly

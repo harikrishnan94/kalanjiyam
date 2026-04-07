@@ -34,7 +34,8 @@ The concrete wire transport is:
 
 ### 3.1 Schema scope
 
-`proto/sevai.proto` MUST define the full current external logical RPC surface:
+`crates/pezhai-sevai/proto/sevai.proto` MUST define the full current external
+logical RPC surface:
 
 - `Put`
 - `Delete`
@@ -98,6 +99,10 @@ No streaming chunk format or delimiter framing is allowed in this binding.
 
 The TCP adapter hosts a loopback listener and maps protobuf request frames to
 the existing `ExternalRequest` API exposed by `PezhaiServer`.
+
+The transport binding and protobuf code generation are owned by the
+`pezhai-sevai` package. The `pezhai` library remains transport-agnostic and
+does not expose a public TCP/protobuf adapter API.
 
 The adapter:
 

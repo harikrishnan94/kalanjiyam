@@ -2,14 +2,13 @@
 name = "kalanjiyam"
 version = "0.1.0"
 edition = "2024"
-description = "High-level starting point for the kalanjiyam key-value store"
+description = "Product-level metadata crate for the kalanjiyam workspace"
 license = "MIT"
 publish = false
 
-[lib]
-name = "kalanjiyam"
-path = "src/lib.rs"
-
-[[bin]]
-name = "kalanjiyam"
-path = "src/main.rs"
+[workspace]
+members = [
+    "crates/pezhai",
+    "crates/pezhai-sevai",
+]
+resolver = "3"

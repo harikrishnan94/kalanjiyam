@@ -139,25 +139,29 @@
 
 ```
 kalanjiyam/
-├── Cargo.toml           # Workspace manifest
+├── Cargo.toml           # Root package + workspace manifest
 ├── Cargo.lock           # Locked dependency versions (commit this)
 ├── README.md
-├── docs/specs/*.md       # Single source of truth for spec
+├── docs/specs/*.md      # Single source of truth for spec
 ├── docs/arch/*.md       # Single source of truth for architecture
 ├── AGENTS.md
 ├── Learnings/
 │   └── Skills.md        # Build, test, and benchmark workflows
 ├── src/
-│   ├── lib.rs           # Library crate root; re-export public API here
-│   ├── error.rs         # Crate-level error type
-│   └── main.rs          # Thin binary entry point
+│   └── lib.rs           # Root kalanjiyam package entry point
+├── crates/
+│   ├── pezhai/
+│   │   └── src/         # Storage engine library crate
+│   └── pezhai-sevai/
+│       └── src/         # Thin server binary crate
 └── tests/
-    └── integration/     # Integration tests (one file per subsystem)
+    └── smoke.rs         # Root-package integration smoke test
 ```
 
-- Keep the binary (`main.rs`) thin. Move all reusable logic into the
-  library crate (`lib.rs` and its submodules).
-- Each database subsystem lives in its own module file under `src/`.
+- Keep executable packages thin. Move all reusable logic into the owning
+  library crate and keep `pezhai-sevai` focused on process bootstrap.
+- Each database subsystem lives in a module file under the owning crate's
+  `src/`.
 - Name module files after their Tamil transliteration
   (e.g., `src/idam.rs` for the storage layer).
 
@@ -179,8 +183,8 @@ kalanjiyam/
 
 ## Testing and Coverage Rules
 
-- Use `cargo test` for test execution.
-- Use `cargo llvm-cov` (or the repository's designated coverage target)
+- Use `cargo test --workspace` for full-workspace test execution.
+- Use `cargo llvm-cov --workspace` (or the repository's designated coverage target)
   to produce both the text summary and the HTML coverage report.
 - Agent-generated tests must include coverage verification for the
   agent's changes.
@@ -193,8 +197,8 @@ kalanjiyam/
   coverage workflow and reporting the result.
 - Unit tests live in a `#[cfg(test)]` module at the bottom of the file
   they test.
-- Integration tests live under `tests/integration/`, one file per
-  subsystem.
+- Integration tests live under the owning package's `tests/` tree. Use
+  `tests/integration/` when one subsystem needs multiple files.
 - Keep tests simple, local, and readable. Prefer deterministic inputs
   over random data.
 
@@ -210,8 +214,8 @@ kalanjiyam/
 
 ## Error Handling
 
-- Define a crate-level error type in `src/error.rs` and re-export it
-  from `lib.rs`.
+- Define crate-level error types in the owning library crate's
+  `src/error.rs` and re-export them from that crate's `lib.rs`.
 - Use the `?` operator for propagation; avoid `unwrap` or `expect`
   outside of tests and examples.
 - In tests, `unwrap` is acceptable; add a short comment explaining what
@@ -299,7 +303,8 @@ kalanjiyam/
 - If either configuration file is missing, do not infer or invent the
   style. Ask the user how to proceed before generating or mass-editing
   code.
-- Resolve all `clippy` warnings with `cargo clippy -- -D warnings`
+- Resolve all `clippy` warnings with
+  `cargo clippy --workspace -- -D warnings`
   before considering a task complete.
 - Do not introduce style changes unrelated to the task.
 
@@ -388,12 +393,12 @@ components)
 
 | Task                       | Command                               |
 |----------------------------|---------------------------------------|
-| Build                      | `cargo build`                         |
-| Run tests                  | `cargo test`                          |
-| Run a specific test        | `cargo test <test_name>`              |
-| Lint                       | `cargo clippy -- -D warnings`         |
-| Format                     | `cargo fmt`                           |
-| Generate docs              | `cargo doc --open`                    |
-| Run benchmarks             | `cargo bench`                         |
-| Check without building     | `cargo check`                         |
-| Coverage (text + HTML)     | `cargo llvm-cov --html`               |
+| Build                      | `cargo build --workspace`             |
+| Run tests                  | `cargo test --workspace`              |
+| Run a specific test        | `cargo test --workspace <test_name>`  |
+| Lint                       | `cargo clippy --workspace -- -D warnings` |
+| Format                     | `cargo fmt --all`                     |
+| Generate docs              | `cargo doc --workspace --open`        |
+| Run benchmarks             | `cargo bench --workspace`             |
+| Check without building     | `cargo check --workspace`             |
+| Coverage (text + HTML)     | `cargo llvm-cov --workspace --html`   |
