@@ -43,18 +43,66 @@ The `kalanjiyam` smoke test lives at the workspace root under `tests/smoke.rs`.
 
 ## Benchmarks
 
-The repository does not yet include committed benchmark targets.
-When benchmark files are added under `benches/`, use:
+Build the current server binary once before running the Python benchmark workflow:
 
 ```bash
-cargo bench --workspace
+cargo build -p pezhai-sevai
 ```
 
-If you only want to verify that benchmark code compiles, use:
+Install the Python protobuf runtime used by the benchmark runner:
 
 ```bash
-cargo bench --workspace --no-run
+python3 -m venv .venv-bench
+source .venv-bench/bin/activate
+python3 -m pip install -r requirements-bench.txt
 ```
+
+Run one or more isolated benchmark workloads:
+
+```bash
+python3 -m benchmarks \
+  --server-binary target/release/pezhai-sevai \
+  --workload pure-put \
+  --workload pure-get \
+  --initial-key-count 1000 \
+  --warmup-seconds 2 \
+  --measure-seconds 5
+```
+
+The runner keeps each logical in-flight lane on its own TCP connection and
+`client_id` stream so the current scaffold's ordering checks remain valid.
+
+Use `--mixed-profile balanced` or `--mixed-ratios put=..,delete=..,get=..,scan=..` for
+`mixed`, or run `benchmarks/run-benchmark.sh <bench-config> <server-config>` with one of the
+presets in `benchmarks/configs/` plus `benchmarks/server/default.toml`. The wrapper validates
+prerequisites and prints setup commands on failure; it does not build the binary or create the
+Python environment. The committed preset configs use `INITIAL_KEY_COUNT=1000000`,
+`WARMUP_SECONDS=5`, and `MEASURE_SECONDS=10`.
+
+```bash
+benchmarks/run-benchmark.sh \
+  benchmarks/configs/pure-get.conf \
+  benchmarks/server/default.toml
+```
+
+The benchmark prints live `populate:` progress every second during preload and `measure:` lines
+every second during the measurement window with current TPS and `p50`/`p95`/`p99` latency.
+
+Run the benchmark test suite:
+
+```bash
+python3 -m unittest benchmarks.tests.test_tcp_bench
+```
+
+Run the benchmark coverage report:
+
+```bash
+python3 benchmarks/tests/coverage_check.py
+```
+
+This report is best-effort in-process coverage. The benchmark smoke suite
+intentionally exercises subprocess CLI paths that stdlib `trace` does not
+follow across process boundaries.
 
 ## Formatting
 

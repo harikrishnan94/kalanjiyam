@@ -1,0 +1,17 @@
+[engine]
+sync_mode = "per_write"
+
+[wal]
+segment_bytes = 1073741824
+group_commit_bytes = 65536
+group_commit_max_delay_ms = 50
+
+[lsm]
+memtable_flush_bytes = 67108864
+base_level_bytes = 268435456
+level_fanout = 10
+l0_file_threshold = 8
+max_levels = 7
+
+[sevai]
+listen_addr = "127.0.0.1:7000"
