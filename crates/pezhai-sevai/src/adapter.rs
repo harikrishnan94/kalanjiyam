@@ -1,5 +1,8 @@
 //! TCP and protobuf adapter owned by the `pezhai-sevai` server package.
 
+#[cfg(test)]
+use std::future::Future;
+
 use buffa::{EnumValue, Message};
 use pezhai::Error;
 use pezhai::sevai::{
@@ -7,9 +10,8 @@ use pezhai::sevai::{
     ExternalResponsePayload, GetRequest, PezhaiServer, PutRequest, ScanFetchNextRequest,
     ScanStartRequest, StatsRequest, Status, StatusCode, SyncRequest,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 mod generated {
@@ -58,89 +60,39 @@ pub async fn run_tcp_adapter(server: PezhaiServer) -> Result<(), Error> {
     owner_result
 }
 
-// Keep one writer task per connection so response frames preserve send order on the socket.
 async fn serve_connection(server: PezhaiServer, stream: TcpStream) -> Result<(), Error> {
-    let (mut reader, mut writer) = stream.into_split();
-    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let mut response_tasks = JoinSet::new();
-
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = frame_rx.recv().await {
-            writer.write_all(&frame).await?;
-        }
-
-        writer.shutdown().await
-    });
-
-    let owner_result = loop {
-        tokio::select! {
-            stopped = server.wait_owner_stopped() => {
-                break Some(stopped);
-            }
-            frame = read_frame(&mut reader) => {
-                let frame = match frame? {
-                    Some(frame) => frame,
-                    None => break None,
-                };
-
-                let envelope = wire::RequestEnvelope::decode_from_slice(&frame).map_err(|error| {
-                    Error::Protocol(format!("failed to decode request envelope: {error}"))
-                })?;
-
-                let request = match decode_request_envelope(envelope) {
-                    Ok(request) => request,
-                    Err(response) => {
-                        let _ = frame_tx.send(encode_response_frame(&response));
-                        continue;
-                    }
-                };
-
-                let server = server.clone();
-                let frame_tx = frame_tx.clone();
-                response_tasks.spawn(async move {
-                    let response = match server.call(request.clone()).await {
-                        Ok(response) => response,
-                        Err(_error) => io_response(
-                            request.client_id,
-                            request.request_id,
-                            false,
-                            "server is no longer available",
-                        ),
-                    };
-                    let _ = frame_tx.send(encode_response_frame(&response));
-                });
-            }
-        }
+    let mut stream = stream;
+    let call_server = |request| {
+        let server = server.clone();
+        async move { dispatch_server_call(server, request).await }
     };
 
-    while let Some(joined) = response_tasks.join_next().await {
-        if let Err(error) = joined
-            && error.is_panic()
-        {
-            return Err(Error::ServerUnavailable(format!(
-                "TCP response task panicked: {error}"
-            )));
+    loop {
+        tokio::select! {
+            stopped = server.wait_owner_stopped() => {
+                stopped?;
+                break;
+            }
+            request = read_request_frame(&mut stream) => {
+                let request = match request? {
+                    Some(request) => request,
+                    None => break,
+                };
+                let response = match request {
+                    DecodedRequest::Valid(request) => call_server(request).await,
+                    DecodedRequest::Invalid(response) => response,
+                };
+                write_response_frame(&mut stream, &response).await?;
+            }
         }
     }
-
-    drop(frame_tx);
-
-    let writer_result = writer_task
-        .await
-        .map_err(|error| Error::ServerUnavailable(format!("TCP writer task failed: {error}")))?
-        .map_err(Error::Io);
-
-    if let Some(owner_result) = owner_result {
-        owner_result?;
-    }
-
-    writer_result
+    stream.shutdown().await.map_err(Error::Io)
 }
 
 // Read exactly one length-prefixed protobuf frame while enforcing the configured size limit.
 async fn read_frame<R>(reader: &mut R) -> Result<Option<Vec<u8>>, Error>
 where
-    R: AsyncReadExt + Unpin,
+    R: AsyncRead + Unpin,
 {
     let mut length_prefix = [0_u8; 4];
     let bytes_read = read_prefix(reader, &mut length_prefix).await?;
@@ -162,7 +114,7 @@ where
 
 async fn read_prefix<R>(reader: &mut R, prefix: &mut [u8]) -> Result<usize, Error>
 where
-    R: AsyncReadExt + Unpin,
+    R: AsyncRead + Unpin,
 {
     let mut filled = 0usize;
     while filled < prefix.len() {
@@ -182,6 +134,67 @@ where
     }
 
     Ok(filled)
+}
+
+// Read and decode one logical request so callers can control when the next socket read happens.
+async fn read_request_frame<R>(reader: &mut R) -> Result<Option<DecodedRequest>, Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some(frame) = read_frame(reader).await? else {
+        return Ok(None);
+    };
+
+    let envelope = wire::RequestEnvelope::decode_from_slice(&frame)
+        .map_err(|error| Error::Protocol(format!("failed to decode request envelope: {error}")))?;
+
+    Ok(Some(match decode_request_envelope(envelope) {
+        Ok(request) => DecodedRequest::Valid(request),
+        Err(response) => DecodedRequest::Invalid(*response),
+    }))
+}
+
+// Serialize exactly one response frame for one completed logical request.
+async fn write_response_frame<W>(writer: &mut W, response: &ExternalResponse) -> Result<(), Error>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&encode_response_frame(response))
+        .await
+        .map_err(Error::Io)
+}
+
+// Call into the logical server and map a stopped owner task into one transport-visible response.
+async fn dispatch_server_call(server: PezhaiServer, request: ExternalRequest) -> ExternalResponse {
+    match server.call(request.clone()).await {
+        Ok(response) => response,
+        Err(_error) => io_response(
+            request.client_id,
+            request.request_id,
+            false,
+            "server is no longer available",
+        ),
+    }
+}
+
+// Drive one connection serially so tests can prove that request admission never pipelines.
+#[cfg(test)]
+async fn serve_connection_loop<S, D, F>(stream: &mut S, mut dispatch: D) -> Result<(), Error>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    D: FnMut(ExternalRequest) -> F,
+    F: Future<Output = ExternalResponse>,
+{
+    while let Some(request) = read_request_frame(stream).await? {
+        let response = match request {
+            DecodedRequest::Valid(request) => dispatch(request).await,
+            DecodedRequest::Invalid(response) => response,
+        };
+        write_response_frame(stream, &response).await?;
+    }
+
+    stream.shutdown().await.map_err(Error::Io)
 }
 
 // Convert one decoded protobuf request into the transport-agnostic library request model.
@@ -430,16 +443,43 @@ fn io_response(
     }
 }
 
+/// One decoded frame that is either ready for logical dispatch or already maps to an error reply.
+enum DecodedRequest {
+    Valid(ExternalRequest),
+    Invalid(ExternalResponse),
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use buffa::Message;
-    use pezhai::sevai::{LevelStats, LogicalShardStats, ScanFetchNextResponse, ScanRow};
-    use tokio::io::AsyncWriteExt;
+    use pezhai::sevai::{
+        LevelStats, LogicalShardStats, PezhaiServer, ScanFetchNextResponse, ScanRow,
+        ServerBootstrapArgs, StatsRequest as LogicalStatsRequest, StatsResponse,
+    };
+    use tokio::io::{AsyncRead, AsyncWriteExt};
+    use tokio::sync::{Notify, oneshot};
 
     use super::{
         Bound, ExternalMethod, ExternalResponse, ExternalResponsePayload, MAX_FRAME_BYTES, Status,
-        StatusCode, decode_request_envelope, encode_response_frame, read_frame, read_prefix, wire,
+        StatusCode, decode_request_envelope, dispatch_server_call, encode_response_frame,
+        read_frame, read_prefix, serve_connection_loop, wire,
     };
+
+    static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
+
+    /// Tracks which requests a test dispatcher has admitted and when it is allowed to finish.
+    struct DispatchProbe {
+        seen_request_ids: Mutex<Vec<u64>>,
+        first_started_tx: Mutex<Option<oneshot::Sender<()>>>,
+        second_started_tx: Mutex<Option<oneshot::Sender<()>>>,
+        release_first: Notify,
+    }
 
     #[test]
     fn decode_request_envelope_rejects_missing_method() {
@@ -601,5 +641,230 @@ mod tests {
         let mut prefix = [0_u8; 4];
         let error = read_prefix(&mut reader, &mut prefix).await.unwrap_err();
         assert!(error.to_string().contains("frame length"));
+    }
+
+    #[tokio::test]
+    async fn serve_connection_loop_waits_for_the_current_response_before_dispatching_more() {
+        let (mut client, mut server_stream) = tokio::io::duplex(1024);
+        let (first_started_tx, first_started_rx) = oneshot::channel();
+        let (second_started_tx, mut second_started_rx) = oneshot::channel();
+        let probe = Arc::new(DispatchProbe {
+            seen_request_ids: Mutex::new(Vec::new()),
+            first_started_tx: Mutex::new(Some(first_started_tx)),
+            second_started_tx: Mutex::new(Some(second_started_tx)),
+            release_first: Notify::new(),
+        });
+
+        let serve_probe = Arc::clone(&probe);
+        let serve_task = tokio::spawn(async move {
+            serve_connection_loop(&mut server_stream, move |request| {
+                let probe = Arc::clone(&serve_probe);
+                async move {
+                    probe
+                        .seen_request_ids
+                        .lock()
+                        .unwrap()
+                        .push(request.request_id);
+                    match request.request_id {
+                        1 => {
+                            if let Some(tx) = probe.first_started_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                            probe.release_first.notified().await;
+                        }
+                        2 => {
+                            if let Some(tx) = probe.second_started_tx.lock().unwrap().take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    ok_stats_response(request.client_id, request.request_id)
+                }
+            })
+            .await
+        });
+
+        client
+            .write_all(&encode_stats_request_frame("serial", 1))
+            .await
+            .unwrap();
+        client
+            .write_all(&encode_stats_request_frame("serial", 2))
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        first_started_rx.await.unwrap();
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(&*probe.seen_request_ids.lock().unwrap(), &[1]);
+        assert!(matches!(
+            second_started_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+
+        probe.release_first.notify_waiters();
+
+        let first_response = read_test_response(&mut client).await;
+        assert_eq!(first_response.request_id, 1);
+
+        let second_response = read_test_response(&mut client).await;
+        assert_eq!(second_response.request_id, 2);
+        assert_eq!(&*probe.seen_request_ids.lock().unwrap(), &[1, 2]);
+
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_connection_loop_replies_to_invalid_requests_before_dispatching_more() {
+        let (mut client, mut server_stream) = tokio::io::duplex(1024);
+        let dispatched_request_ids = Arc::new(Mutex::new(Vec::new()));
+        let serve_dispatched_request_ids = Arc::clone(&dispatched_request_ids);
+        let serve_task = tokio::spawn(async move {
+            serve_connection_loop(&mut server_stream, move |request| {
+                let dispatched_request_ids = Arc::clone(&serve_dispatched_request_ids);
+                async move {
+                    dispatched_request_ids
+                        .lock()
+                        .unwrap()
+                        .push(request.request_id);
+                    ok_stats_response(request.client_id, request.request_id)
+                }
+            })
+            .await
+        });
+
+        client
+            .write_all(&encode_request_frame(
+                wire::RequestEnvelope {
+                    client_id: "serial".into(),
+                    request_id: 1,
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            ))
+            .await
+            .unwrap();
+        client
+            .write_all(&encode_stats_request_frame("serial", 2))
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+
+        let invalid_response = read_test_response(&mut client).await;
+        assert_eq!(invalid_response.request_id, 1);
+        assert_eq!(
+            invalid_response.status.code.to_i32(),
+            wire::StatusCode::STATUS_CODE_INVALID_ARGUMENT as i32
+        );
+
+        let valid_response = read_test_response(&mut client).await;
+        assert_eq!(valid_response.request_id, 2);
+        assert_eq!(&*dispatched_request_ids.lock().unwrap(), &[2],);
+
+        serve_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn dispatch_server_call_maps_a_stopped_owner_to_io() {
+        let server = start_test_server().await;
+        server.shutdown().await.unwrap();
+        server.wait_stopped().await.unwrap();
+
+        let response = dispatch_server_call(
+            server,
+            pezhai::sevai::ExternalRequest {
+                client_id: "stopped".into(),
+                request_id: 1,
+                cancel_token: None,
+                method: ExternalMethod::Stats(LogicalStatsRequest),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status.code, StatusCode::Io);
+        assert_eq!(
+            response.status.message.as_deref(),
+            Some("server is no longer available"),
+        );
+    }
+
+    async fn start_test_server() -> PezhaiServer {
+        PezhaiServer::start(ServerBootstrapArgs {
+            config_path: write_test_config(),
+        })
+        .await
+        .unwrap()
+    }
+
+    fn write_test_config() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("adapter-test-{unique}-{config_id}.toml"));
+        fs::write(
+            &path,
+            r#"
+[engine]
+sync_mode = "per_write"
+
+[sevai]
+listen_addr = "127.0.0.1:0"
+"#,
+        )
+        .unwrap();
+        path
+    }
+
+    fn encode_stats_request_frame(client_id: &str, request_id: u64) -> Vec<u8> {
+        encode_request_frame(
+            wire::RequestEnvelope {
+                client_id: client_id.into(),
+                request_id,
+                cancel_token: None,
+                method: wire::StatsRequest::default().into(),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        )
+    }
+
+    fn encode_request_frame(payload: Vec<u8>) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(4 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    async fn read_test_response<R>(reader: &mut R) -> wire::ResponseEnvelope
+    where
+        R: AsyncRead + Unpin,
+    {
+        let payload = read_frame(reader).await.unwrap().unwrap();
+        wire::ResponseEnvelope::decode_from_slice(&payload).unwrap()
+    }
+
+    fn ok_stats_response(client_id: String, request_id: u64) -> ExternalResponse {
+        ExternalResponse {
+            client_id,
+            request_id,
+            status: Status {
+                code: StatusCode::Ok,
+                retryable: false,
+                message: None,
+            },
+            payload: Some(ExternalResponsePayload::Stats(StatsResponse {
+                observation_seqno: 0,
+                data_generation: 0,
+                levels: Vec::new(),
+                logical_shards: Vec::new(),
+            })),
+        }
     }
 }

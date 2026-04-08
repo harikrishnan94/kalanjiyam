@@ -37,41 +37,29 @@ The long-term actor services are the owner actor, a worker actor pool for
 immutable blocking jobs, and a dedicated WAL sync actor for durability batches.
 Handles submit work only through the owner actor mailbox, which preserves the
 single serialized publication boundary defined in `docs/specs/sevai.md`.
-The owner actor does not write transport bytes directly; adapter-owned tasks
-encode responses and hand them to the per-connection writer path.
+The owner actor does not write transport bytes directly; each adapter-owned
+connection handler encodes the response it receives and writes it back to the
+socket after the logical request completes.
 
 ### Current Scaffold Runtime Flow
 
 The current scaffold keeps ordinary request execution inside the owner actor and
-the adapter-owned tasks around it. Tokio may schedule those tasks on any
-runtime worker, so the flow below is task-oriented rather than thread-oriented.
-The owner actor is still the only component that mutates shared server state.
+the adapter-owned connection handlers around it. Tokio may schedule those
+handlers on any runtime worker, so the flow below is task-oriented rather than
+thread-oriented. The owner actor is still the only component that mutates
+shared server state.
 
 ```text
 transport peer
     |
     v
 +---------------------------+
-| TCP adapter               |
-| - accept connection       |
-| - read frame              |
-| - decode RequestEnvelope  |
-+---------------------------+
-    |
-    | spawn per-request response task
-    v
-+---------------------------+     mpsc::UnboundedSender<OwnerCommand>
-| response task             | ----------------------------------------+
+| TCP connection handler    | ----------------------------------------+
+| - read one frame          |     mpsc::UnboundedSender<OwnerCommand> |
+| - decode RequestEnvelope  |                                         |
 | - call server.call()      |                                         |
 | - await oneshot reply     | <------------------------------------+  |
 | - encode ResponseEnvelope |      oneshot::Sender<ExternalResponse> |  |
-+---------------------------+                                      |  |
-    |                                                              |  |
-    | frame_tx                                                     |  |
-    v                                                              |  |
-+---------------------------+                                      |  |
-| connection writer task    |                                      |  |
-| - serialize socket writes |                                      |  |
 | - write response bytes    |                                      |  |
 +---------------------------+                                      |  |
     |                                                              |  |
@@ -197,12 +185,12 @@ for frame decoding and encoding. The adapter listens on the
 `[sevai].listen_addr` endpoint and performs framed exchanges: each loop
 iteration reads 4 big-endian bytes, then that many protobuf payload bytes,
 decodes a `RequestEnvelope`, maps it to a logical request, and dispatches the
-work through the shared server handle. Response tasks encode
-`ResponseEnvelope` messages with the matching `client_id`/`request_id`, letting
-one TCP connection keep multiple requests in flight while preserving the
-server-owned ordering rules. During shutdown, the adapter stops accepting new
-connections, notifies live handlers to exit, waits for those handler tasks to
-finish, and only then lets `wait_stopped` observe full shutdown completion.
+work through the shared server handle. Each connection handler processes one
+request/response cycle at a time and does not read the next frame until it has
+written the current response back to the socket. During shutdown, the adapter
+stops accepting new connections, lets live handlers finish the request they are
+already processing, and prevents those handlers from reading any further work
+before `wait_stopped` observes full shutdown completion.
 Errors from malformed frames or bytes are returned as transport-level failures
 before reaching the logical layer.
 

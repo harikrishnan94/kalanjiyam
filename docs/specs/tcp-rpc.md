@@ -74,7 +74,11 @@ The protobuf schema MUST include wire equivalents for:
 Per-client ordering semantics are preserved by the existing logical model that
 keys ordering on `client_id` plus `request_id`.
 
-For clients, each TCP connection can handle multiple in-flight requests.
+For clients, each TCP connection MUST process at most one in-flight request at a
+time.
+The TCP adapter MUST NOT read the next request frame from one connection until
+it has finished processing and writing the response for the current request on
+that same connection.
 
 ## 4. Framing Rules
 
@@ -111,3 +115,5 @@ The adapter:
   `request_id` unchanged
 - maps logical status and payload variants without changing behavior
 - returns one framed protobuf response for each framed protobuf request
+- serializes each TCP connection so one request/response cycle finishes before
+  the next request frame is read from that connection
