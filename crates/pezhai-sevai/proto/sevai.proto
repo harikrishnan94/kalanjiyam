@@ -63,9 +63,6 @@ message ScanFetchNextRequest {
   uint64 scan_id = 1;
 }
 
-// `Sync` request payload.
-message SyncRequest {}
-
 // `Stats` request payload.
 message StatsRequest {}
 
@@ -81,8 +78,8 @@ message RequestEnvelope {
     GetRequest get = 12;
     ScanStartRequest scan_start = 13;
     ScanFetchNextRequest scan_fetch_next = 14;
-    SyncRequest sync = 15;
-    StatsRequest stats = 16;
+    // Deliberate wire break: `stats` moved from tag 16 to tag 15 when `Sync` was removed.
+    StatsRequest stats = 15;
   }
 }
 
@@ -117,11 +114,6 @@ message ScanStartResponse {
 message ScanFetchNextResponse {
   repeated ScanRow rows = 1;
   bool eof = 2;
-}
-
-// `Sync` success payload.
-message SyncResponse {
-  uint64 durable_seqno = 1;
 }
 
 // Level-wise shared-data stats entry.
@@ -159,7 +151,7 @@ message ResponseEnvelope {
     GetResponse get = 12;
     ScanStartResponse scan_start = 13;
     ScanFetchNextResponse scan_fetch_next = 14;
-    SyncResponse sync = 15;
-    StatsResponse stats = 16;
+    // Deliberate wire break: `stats` moved from tag 16 to tag 15 when `Sync` was removed.
+    StatsResponse stats = 15;
   }
 }

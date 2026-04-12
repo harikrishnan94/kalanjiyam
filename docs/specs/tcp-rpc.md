@@ -42,7 +42,6 @@ logical RPC surface:
 - `Get`
 - `ScanStart`
 - `ScanFetchNext`
-- `Sync`
 - `Stats`
 
 It MUST NOT define network RPC methods for startup or shutdown.
@@ -65,7 +64,6 @@ The protobuf schema MUST include wire equivalents for:
 - `ScanStartResponse`
 - `ScanFetchNextResponse`
 - `ScanRow`
-- `SyncResponse`
 - `LevelStats`
 - `LogicalShardStats`
 

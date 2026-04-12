@@ -56,7 +56,7 @@ Worker actors are stateless across jobs and may keep only per-task scratch state
 is running. [BEHAVIORAL]
 The owner actor MUST invoke the engine's shared internal operation model for storage-engine
 operations instead of maintaining a separate server-only execution path for `put`, `delete`,
-`get`, `scan`, `sync`, `stats`, or internal snapshot commands. [BEHAVIORAL]
+`get`, `scan`, `stats`, or internal snapshot commands. [BEHAVIORAL]
 The owner actor MUST host the engine's mutable storage parts directly as ordinary owner-actor
 state, including at minimum `EngineState`, `WalSyncService`, and any pending WAL-reply
 bookkeeping, rather than routing through a second private synchronous core abstraction.
@@ -87,7 +87,7 @@ Success means:
   transport [BEHAVIORAL]
 - internal RPC message types are defined exactly enough that independent implementations route work
   the same way [BEHAVIORAL]
-- `put`, `delete`, `get`, `scan`, `sync`, and `stats` preserve the engine semantics already
+- `put`, `delete`, `get`, `scan`, and `stats` preserve the engine semantics already
   defined in `docs/specs/pezhai.md` [BEHAVIORAL]
 - server startup reads one configuration file path from the command line and uses that path to open
   the engine before serving requests [BEHAVIORAL]
@@ -175,7 +175,7 @@ function conceptual_server_rule(request):
 - one or more stateless worker actors [BEHAVIORAL]
 - process startup that receives one configuration-file path as a command-line argument and opens the
   engine before serving requests [BEHAVIORAL]
-- transport-agnostic external logical RPC for `put`, `delete`, `get`, `scan`, `sync`, and `stats`
+- transport-agnostic external logical RPC for `put`, `delete`, `get`, `scan`, and `stats`
   [BEHAVIORAL]
 - transport-agnostic internal logical RPC for snapshot control, reads, scans, WAL sync,
   flush, compaction, checkpoint, and garbage collection [BEHAVIORAL]
@@ -255,10 +255,10 @@ Worker actors:
   apply ordering, cancellation, and backpressure policy around the decision, but it MUST NOT
   duplicate snapshot validation, active-memtable fast-path selection, immutable-source capture, or
   WAL waiter registration outside the engine [BEHAVIORAL]
-- WAL wake handling, explicit sync-waiter cancellation, maintenance polling/capture, maintenance
-  result publication validation, worker read completion re-entry, and shutdown acknowledgement MUST
-  all route through that same engine shell rather than through separate server-only storage hooks
-  [BEHAVIORAL]
+- WAL wake handling, write-durability waiter release, maintenance polling/capture, maintenance
+  result publication validation, worker read completion re-entry, and shutdown acknowledgement
+  MUST all route through that same engine shell rather than through separate server-only storage
+  hooks [BEHAVIORAL]
 
 Worked example:
 
@@ -579,7 +579,6 @@ The external method set is:
 - `Get`
 - `ScanStart`
 - `ScanFetchNext`
-- `Sync`
 - `Stats`
 
 The storage-engine operations `create_snapshot` and `release_snapshot` remain internal-only in v1.
@@ -594,7 +593,7 @@ Rules:
 - the configuration file path used for `open(config_path)` comes from process bootstrap, not from
   any external request payload [BEHAVIORAL]
 - once the server is in `Ready`, external clients interact only through `Put`, `Delete`, `Get`,
-  `ScanStart`, `ScanFetchNext`, `Sync`, and `Stats` [BEHAVIORAL]
+  `ScanStart`, `ScanFetchNext`, and `Stats` [BEHAVIORAL]
 
 ### 5.4 `Put`
 
@@ -774,37 +773,7 @@ Rules:
 - when `eof = true`, the owner actor MUST release the internal snapshot handle and delete the scan
   session before replying success [BEHAVIORAL]
 
-### 5.9 `Sync`
-
-Request:
-
-```text
-SyncRequest {}
-```
-
-Response:
-
-```text
-SyncResponse {
-    durable_seqno: u64
-}
-```
-
-Rules:
-
-- `Sync` MUST preserve the storage-engine `sync()` semantics [BEHAVIORAL]
-- the owner actor MUST translate `Sync` into one durability target on the current WAL append
-  frontier [BEHAVIORAL]
-- `SyncResponse.durable_seqno` MUST be the greatest committed seqno whose WAL record is guaranteed
-  durable at reply time; if no committed seqno is yet durable, it MUST be `0` [BEHAVIORAL]
-- the blocking durable-frontier advancement work MUST execute on the engine-owned dedicated WAL
-  sync actor, not through the generic worker actor pool [BEHAVIORAL]
-- multiple waiting writes and explicit `Sync` requests MAY share one group-commit batch when their
-  required durable frontier overlaps [BEHAVIORAL]
-- if the current durable frontier already covers the requested seqno, the owner actor MUST reply
-  immediately without dispatching new WAL sync work [BEHAVIORAL]
-
-### 5.10 `Stats`
+### 5.9 `Stats`
 
 Request:
 
@@ -1208,27 +1177,7 @@ finish_scan_fetch_request(state, session, page_or_worker_result):
     maybe_start_next_scan_fetch(state, session)
 ```
 
-### 7.4 `Sync` routing
-
-Rules:
-
-- the owner actor MUST register one waiter keyed by durable seqno frontier, not by one permanent
-  segment identity [BEHAVIORAL]
-- if the current durable frontier already covers the target seqno, the request MUST complete
-  immediately without new dispatch [BEHAVIORAL]
-- the server MUST use the engine-owned `sync` operation path to create or complete the waiter; it
-  MUST NOT keep a separate server-only sync-target planner [BEHAVIORAL]
-- otherwise the owner actor MUST issue one request to the dedicated WAL sync actor and wait for a
-  returned frontier that covers the request [BEHAVIORAL]
-- multiple waiting writes and explicit `Sync` requests MAY share one WAL sync actor batch when their
-  required durable frontier overlaps [BEHAVIORAL]
-- the WAL sync actor MUST flush when either the unsynced bytes since the last published durable
-  frontier reach `wal.group_commit_bytes`, or the oldest pending waiter reaches
-  `wal.group_commit_max_delay_ms`, whichever happens first [BEHAVIORAL]
-- when the WAL sync actor returns success, the owner actor MUST advance the durable frontier and
-  release all satisfied waiters [BEHAVIORAL]
-
-### 7.5 Write routing
+### 7.4 Write routing
 
 Rules:
 
@@ -1238,6 +1187,21 @@ Rules:
 - in `PerWrite` mode, the owner actor MUST register a durability waiter after the WAL append and
   MUST acknowledge only after the dedicated WAL sync actor reports a covering durable frontier
   [BEHAVIORAL]
+- the owner actor MUST register write durability waiters by durable seqno frontier, not by one
+  permanent segment identity [BEHAVIORAL]
+- if the current durable frontier already covers one write's target seqno, that write MAY
+  acknowledge immediately without dispatching new WAL sync work [BEHAVIORAL]
+- the server MUST use the engine-owned durability path to create or complete write waiters; it
+  MUST NOT keep a separate server-only sync-target planner [BEHAVIORAL]
+- otherwise the owner actor MUST issue one request to the dedicated WAL sync actor and wait for a
+  returned frontier that covers the write [BEHAVIORAL]
+- multiple waiting writes MAY share one WAL sync actor batch when their required durable frontiers
+  overlap [BEHAVIORAL]
+- the WAL sync actor MUST flush when either the unsynced bytes since the last published durable
+  frontier reach `wal.group_commit_bytes`, or the oldest pending write waiter reaches
+  `wal.group_commit_max_delay_ms`, whichever happens first [BEHAVIORAL]
+- when the WAL sync actor returns success, the owner actor MUST advance the durable frontier and
+  release all satisfied write waiters [BEHAVIORAL]
 - if thresholds are crossed, the owner actor MAY freeze the active memtable and enqueue background
   maintenance after the write becomes visible [BEHAVIORAL]
 
@@ -1320,7 +1284,6 @@ Rules:
   [BEHAVIORAL]
 - running tasks MUST observe cancellation on a best-effort basis between expensive steps
   [BEHAVIORAL]
-- queued explicit `Sync` waiters MAY be cancelled before they become durable [BEHAVIORAL]
 - once an operation has crossed an externally visible or durability-relevant point, cancellation
   MUST NOT roll back its effects; the server MAY drop response delivery to the cancelled client, but
   the internal operation MUST run to its normal publish or completion point [BEHAVIORAL]
@@ -1346,7 +1309,7 @@ The server MUST enforce finite implementation-defined limits for:
 - total active scan sessions [BEHAVIORAL]
 - total in-flight page tasks [BEHAVIORAL]
 - total queued `ScanFetchNext` requests per scan session [BEHAVIORAL]
-- total waiting WAL sync requests [BEHAVIORAL]
+- total waiting write durability waiters [BEHAVIORAL]
 
 Rules:
 
@@ -1363,8 +1326,8 @@ Rules:
 - `InvalidArgument`, `Checksum`, and `Corruption` MUST be returned with `retryable = false`
   [BEHAVIORAL]
 - `Busy` MUST be returned with `retryable = true` [BEHAVIORAL]
-- user-request `IO` caused by worker execution of `Get`, `ScanFetchNext`, or `Sync` MUST be
-  returned with `retryable = true` [BEHAVIORAL]
+- user-request `IO` caused by worker execution of `Get` or `ScanFetchNext`, or by WAL durability
+  work on behalf of `Put` or `Delete`, MUST be returned with `retryable = true` [BEHAVIORAL]
 - `IO` caused only by server lifecycle state `Booting` or `Stopping` MUST use `retryable = true`
   [BEHAVIORAL]
 - `IO` caused by lifecycle state `StartFailed` or `Stopped` MUST use `retryable = false`
@@ -1405,8 +1368,8 @@ An implementation conforms to this specification only if all of the following ho
    changes directly [BEHAVIORAL]
 9. `Put` and `Delete` acknowledgement obey the configured sync-mode durability rules
    [BEHAVIORAL]
-10. recoverable worker `IO` for user-visible reads or sync is surfaced externally as retryable
-   `IO` [BEHAVIORAL]
+10. recoverable worker `IO` for user-visible reads, plus recoverable WAL durability `IO` on
+    behalf of writes, is surfaced externally as retryable `IO` [BEHAVIORAL]
 11. recoverable worker `IO` for automatic maintenance is retried internally [BEHAVIORAL]
 12. bounded queues cause admission-time `Busy` rather than unbounded growth [BEHAVIORAL]
 13. per-client request ordering is enforced by the owner actor while same-scan fetch ordering is
@@ -1424,6 +1387,6 @@ Required test categories:
 - scan expiry or shutdown cleanup releases the internal snapshot
 - worker `FlushTaskResult` is rejected as `Stale` when source generation changes before publish
 - worker `CompactTaskResult` is rejected as `Stale` when exact input files no longer match
-- one shared WAL sync actor batch satisfies multiple waiters
+- one shared WAL sync actor batch satisfies multiple write waiters
 - backpressure rejects requests with `Busy` before state mutation
 - client disconnect cancels that client's queued work without destroying a shared scan session

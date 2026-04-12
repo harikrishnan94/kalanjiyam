@@ -8,7 +8,7 @@ use pezhai::Error;
 use pezhai::sevai::{
     Bound, DeleteRequest, ExternalMethod, ExternalRequest, ExternalResponse,
     ExternalResponsePayload, GetRequest, PezhaiServer, PutRequest, ScanFetchNextRequest,
-    ScanStartRequest, StatsRequest, Status, StatusCode, SyncRequest,
+    ScanStartRequest, StatsRequest, Status, StatusCode,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -247,7 +247,6 @@ fn decode_request_envelope(
                 scan_id: request.scan_id,
             })
         }
-        wire::request_envelope::Method::Sync(_request) => ExternalMethod::Sync(SyncRequest),
         wire::request_envelope::Method::Stats(_request) => ExternalMethod::Stats(StatsRequest),
     };
 
@@ -344,11 +343,6 @@ fn encode_response_payload(payload: &ExternalResponsePayload) -> wire::response_
                 })
                 .collect(),
             eof: response.eof,
-            ..Default::default()
-        }
-        .into(),
-        ExternalResponsePayload::Sync(response) => wire::SyncResponse {
-            durable_seqno: response.durable_seqno,
             ..Default::default()
         }
         .into(),

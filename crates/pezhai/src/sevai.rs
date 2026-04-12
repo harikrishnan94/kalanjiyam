@@ -70,8 +70,6 @@ pub enum ExternalMethod {
     ScanStart(ScanStartRequest),
     /// Fetch the next page for an existing scan.
     ScanFetchNext(ScanFetchNextRequest),
-    /// Wait for the latest committed seqno to be durable.
-    Sync(SyncRequest),
     /// Read the server's current statistics view.
     Stats(StatsRequest),
 }
@@ -119,10 +117,6 @@ pub struct ScanFetchNextRequest {
     pub scan_id: u64,
 }
 
-/// Logical `Sync` request payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SyncRequest;
-
 /// Logical `Stats` request payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatsRequest;
@@ -148,7 +142,6 @@ pub enum ExternalResponsePayload {
     Get(GetResponse),
     ScanStart(ScanStartResponse),
     ScanFetchNext(ScanFetchNextResponse),
-    Sync(SyncResponse),
     Stats(StatsResponse),
 }
 
@@ -232,13 +225,6 @@ pub struct ScanFetchNextResponse {
     pub rows: Vec<ScanRow>,
     /// Whether this page reached the end of the scan snapshot.
     pub eof: bool,
-}
-
-/// `Sync` success payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SyncResponse {
-    /// Greatest committed seqno guaranteed durable at reply time.
-    pub durable_seqno: u64,
 }
 
 /// One level-wise stats entry.
@@ -654,16 +640,6 @@ impl OwnerState {
                 if let Some(response) = self.handle_scan_fetch_next(&request, body) {
                     self.finish_request(response);
                 }
-            }
-            ExternalMethod::Sync(_body) => {
-                let response = ok_response(
-                    request.client_id.clone(),
-                    request.request_id,
-                    ExternalResponsePayload::Sync(SyncResponse {
-                        durable_seqno: self.last_committed_seqno,
-                    }),
-                );
-                self.finish_request(response);
             }
             ExternalMethod::Stats(_body) => {
                 let response = self.handle_stats(&request);
@@ -1403,13 +1379,13 @@ mod tests {
 
     use super::{
         Bound, ExternalMethod, ExternalResponsePayload, GetRequest, PezhaiServer, PutRequest,
-        ScanFetchNextRequest, ScanStartRequest, ServerBootstrapArgs, StatsRequest, SyncRequest,
+        ScanFetchNextRequest, ScanStartRequest, ServerBootstrapArgs, StatsRequest,
     };
 
     static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
 
     #[tokio::test]
-    async fn put_delete_get_and_sync_follow_the_stub_model() {
+    async fn put_delete_and_get_follow_the_stub_model() {
         let server = start_test_server().await;
 
         let put_response = server
@@ -1447,26 +1423,10 @@ mod tests {
             }))
         );
 
-        let sync_response = server
-            .call(test_request(
-                "client-a",
-                9,
-                None,
-                ExternalMethod::Sync(SyncRequest),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            sync_response.payload,
-            Some(ExternalResponsePayload::Sync(super::SyncResponse {
-                durable_seqno: 1,
-            }))
-        );
-
         let delete_response = server
             .call(test_request(
                 "client-a",
-                10,
+                9,
                 None,
                 ExternalMethod::Delete(super::DeleteRequest {
                     key: b"ant".to_vec(),
@@ -1479,7 +1439,7 @@ mod tests {
         let missing_response = server
             .call(test_request(
                 "client-a",
-                11,
+                10,
                 None,
                 ExternalMethod::Get(GetRequest {
                     key: b"ant".to_vec(),

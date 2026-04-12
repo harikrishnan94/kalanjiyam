@@ -81,6 +81,34 @@ async fn framed_tcp_round_trip_returns_expected_payloads() {
         other => panic!("unexpected payload: {other:?}"),
     }
 
+    write_frame(
+        &mut stream,
+        wire::RequestEnvelope {
+            client_id: "tcp-client".into(),
+            request_id: 3,
+            cancel_token: None,
+            method: wire::StatsRequest::default().into(),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+    )
+    .await;
+
+    let stats_response = read_response(&mut stream).await;
+    assert_eq!(
+        stats_response.status.code.to_i32(),
+        wire::StatusCode::STATUS_CODE_OK as i32
+    );
+    match stats_response.payload {
+        Some(wire::response_envelope::Payload::Stats(payload)) => {
+            assert_eq!(payload.observation_seqno, 1);
+            assert_eq!(payload.data_generation, 1);
+            assert_eq!(payload.levels.len(), 0);
+            assert_eq!(payload.logical_shards.len(), 1);
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
     stop_server(server, adapter_task).await;
 }
 
@@ -156,6 +184,30 @@ async fn duplicate_and_gap_request_ids_are_reported_as_invalid_argument() {
     assert_eq!(
         gap_response.status.code.to_i32(),
         wire::StatusCode::STATUS_CODE_INVALID_ARGUMENT as i32
+    );
+
+    stop_server(server, adapter_task).await;
+}
+
+#[tokio::test]
+async fn legacy_stats_tag_sixteen_is_rejected_as_invalid_argument() {
+    let (server, adapter_task, addr) = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    write_frame(
+        &mut stream,
+        encode_legacy_stats_request_payload("legacy-client", 1),
+    )
+    .await;
+
+    let response = read_response(&mut stream).await;
+    assert_eq!(
+        response.status.code.to_i32(),
+        wire::StatusCode::STATUS_CODE_INVALID_ARGUMENT as i32
+    );
+    assert_eq!(
+        response.status.message.as_deref(),
+        Some("request envelope did not contain a method")
     );
 
     stop_server(server, adapter_task).await;
@@ -269,4 +321,25 @@ async fn read_response(stream: &mut TcpStream) -> wire::ResponseEnvelope {
     let mut payload = vec![0_u8; frame_len];
     stream.read_exact(&mut payload).await.unwrap();
     wire::ResponseEnvelope::decode_from_slice(&payload).unwrap()
+}
+
+// Encode the pre-removal Stats request shape, which used field tag 16 in the request oneof.
+fn encode_legacy_stats_request_payload(client_id: &str, request_id: u64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(client_id.len() + 8);
+    payload.push(0x0a);
+    payload.push(client_id.len().try_into().unwrap());
+    payload.extend_from_slice(client_id.as_bytes());
+    payload.push(0x10);
+    encode_varint(request_id, &mut payload);
+    payload.extend_from_slice(&[0x82, 0x01, 0x00]);
+    payload
+}
+
+// Write one protobuf varint so transport tests can craft legacy wire payloads directly.
+fn encode_varint(mut value: u64, output: &mut Vec<u8>) {
+    while value >= 0x80 {
+        output.push(((value as u8) & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
 }

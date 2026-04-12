@@ -152,10 +152,9 @@ metadata, and queued fetch state) and returns a `scan_id`. `ScanFetchNext`
 pages through that captured row set, guaranteeing at least one row per non-EOF
 reply. EOF deletes the session; cancellation removes only the cancelled queued
 request or returns a cancelled response for the active fetch while leaving the
-session available for later fetches. `Sync` immediately returns the current
-`last_committed_seqno` as the scaffold's stub durable value, and `Stats`
-reports the owner seqno/generation plus stub empty level stats with one logical
-shard entry covering the whole space.
+session available for later fetches. `Stats` reports the owner
+seqno/generation plus stub empty level stats with one logical shard entry
+covering the whole space.
 
 ### Current Scaffold Deviations From Spec
 
@@ -165,13 +164,12 @@ The current scaffold is intentionally narrower than `docs/specs/sevai.md`.
   not yet route storage operations through the engine-owned internal operation
   shell described in the spec.
 - The conceptual worker actor pool and dedicated WAL sync actor are not yet in
-  the live request path. Ordinary `Get`, `ScanFetchNext`, and `Sync` work stay
+  the live request path. Ordinary `Get`, `ScanFetchNext`, and `Stats` work stay
   inside the owner actor plus adapter-owned runtime tasks.
 - `ScanStart` captures rows eagerly into the session instead of creating the
   internal snapshot handle and delegated scan task model described by the spec.
-- `Sync` returns the current `last_committed_seqno` immediately as a stub
-  durable value. It does not yet model WAL append, durable-frontier tracking,
-  or dedicated WAL sync batching.
+- Write acknowledgement does not yet model `sync_mode`-driven WAL append,
+  durable-frontier tracking, or dedicated WAL sync batching.
 - Cancelling one `ScanFetchNext` request does not close the whole session in the
   scaffold. Session deletion happens on EOF or shutdown cleanup, not on
   per-request cancellation alone.
