@@ -47,6 +47,12 @@ impl StoreLayout {
         &self.store_root
     }
 
+    /// Returns the canonical `CURRENT` file path.
+    #[must_use]
+    pub(crate) fn current_path(&self) -> PathBuf {
+        self.store_root.join("CURRENT")
+    }
+
     /// Returns the canonical WAL directory path.
     #[must_use]
     pub(crate) fn wal_dir(&self) -> &Path {
@@ -78,6 +84,7 @@ mod tests {
 
         assert_eq!(layout.config_path(), Path::new("/srv/pezhai/config.toml"));
         assert_eq!(layout.store_root(), Path::new("/srv/pezhai"));
+        assert_eq!(layout.current_path(), Path::new("/srv/pezhai/CURRENT"));
         assert_eq!(layout.wal_dir(), Path::new("/srv/pezhai/wal"));
         assert_eq!(layout.meta_dir(), Path::new("/srv/pezhai/meta"));
         assert_eq!(layout.data_dir(), Path::new("/srv/pezhai/data"));
@@ -88,6 +95,7 @@ mod tests {
         let layout = StoreLayout::from_config_path(Path::new("config.toml"));
 
         assert_eq!(layout.store_root(), Path::new("."));
+        assert_eq!(layout.current_path(), Path::new("./CURRENT"));
         assert_eq!(layout.wal_dir(), Path::new("./wal"));
         assert_eq!(layout.meta_dir(), Path::new("./meta"));
         assert_eq!(layout.data_dir(), Path::new("./data"));

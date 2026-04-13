@@ -1,13 +1,20 @@
 //! Public engine shell and shared operation foundations for the `Pezhai` storage engine.
 
+use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
+use std::thread::JoinHandle;
 
-use crate::config::load_runtime_config;
+use tokio::sync::oneshot;
+
+use crate::config::{SyncMode, load_runtime_config};
 use crate::error::Error;
 use crate::idam::StoreLayout;
-use crate::nilaimai::EngineState;
-use crate::pathivu::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
+use crate::nilaimai::{EngineState, Mutation};
+use crate::pathivu::{
+    MAX_KEY_BYTES, MAX_VALUE_BYTES, WalRecovery, WalWriter, WalWriterTestOptions, read_current,
+    recover_wal,
+};
 
 pub use crate::sevai::{Bound, GetResponse, LevelStats, LogicalShardStats, ScanRow, StatsResponse};
 
@@ -122,46 +129,21 @@ pub struct SyncResponse {
 /// Direct storage-engine handle used by in-process callers.
 pub struct PezhaiEngine {
     core: Arc<EngineCore>,
-}
-
-impl Clone for PezhaiEngine {
-    fn clone(&self) -> Self {
-        Self {
-            core: Arc::clone(&self.core),
-        }
-    }
+    wal_runtime: WalRuntime,
 }
 
 impl PezhaiEngine {
     /// Opens one engine instance from a validated config path.
     ///
-    /// This is synchronous because bootstrap config and directory planning happen before the
-    /// async data-plane methods are used.
+    /// This is synchronous because config parsing, store discovery, and WAL replay complete before
+    /// the async data-plane methods are used.
     pub fn open(config_path: &Path) -> Result<Self, Error> {
-        let config = load_runtime_config(config_path).map_err(Error::from)?;
-        let layout = StoreLayout::from_config_path(config_path);
-        let _ = (
-            layout.config_path(),
-            layout.store_root(),
-            layout.wal_dir(),
-            layout.meta_dir(),
-            layout.data_dir(),
-        );
-
-        Ok(Self {
-            core: Arc::new(EngineCore {
-                state: Mutex::new(EngineState::new(config)),
-            }),
-        })
+        Self::open_with_options(config_path, EngineTestOptions::default())
     }
 
-    /// Closes one open engine instance.
-    ///
-    /// The milestone-1 foundation does not hold external durable resources yet, so close is a
-    /// successful no-op.
-    pub fn close(self) -> Result<(), Error> {
-        drop(self);
-        Ok(())
+    /// Closes one open engine instance and waits for the internal WAL worker to stop.
+    pub fn close(mut self) -> Result<(), Error> {
+        self.shutdown_worker()
     }
 
     /// Creates one stable snapshot handle pinned to the current committed frontier.
@@ -200,8 +182,27 @@ impl PezhaiEngine {
     pub async fn put(&self, key: &[u8], value: &[u8]) -> Result<(), Error> {
         validate_key(key)?;
         validate_value(value)?;
-        self.core.lock_state()?.put(key, value);
-        Ok(())
+        let mutation = Mutation::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        };
+        let (seqno, sync_mode) = {
+            let mut state = self.core.lock_state()?;
+            (state.reserve_seqno()?, state.sync_mode())
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.wal_runtime
+            .command_tx
+            .send(WalCommand::AppendMutation {
+                seqno,
+                mutation,
+                sync_mode,
+                reply: reply_tx,
+            })
+            .map_err(wal_worker_send_error)?;
+
+        reply_rx.await.map_err(wal_worker_reply_error)?
     }
 
     /// Appends one tombstone for one key.
@@ -209,8 +210,24 @@ impl PezhaiEngine {
     /// Returns `InvalidArgument` when the key exceeds the documented limit.
     pub async fn delete(&self, key: &[u8]) -> Result<(), Error> {
         validate_key(key)?;
-        self.core.lock_state()?.delete(key);
-        Ok(())
+        let mutation = Mutation::Delete { key: key.to_vec() };
+        let (seqno, sync_mode) = {
+            let mut state = self.core.lock_state()?;
+            (state.reserve_seqno()?, state.sync_mode())
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.wal_runtime
+            .command_tx
+            .send(WalCommand::AppendMutation {
+                seqno,
+                mutation,
+                sync_mode,
+                reply: reply_tx,
+            })
+            .map_err(wal_worker_send_error)?;
+
+        reply_rx.await.map_err(wal_worker_reply_error)?
     }
 
     /// Reads one key at either the latest view or one explicit snapshot.
@@ -257,7 +274,27 @@ impl PezhaiEngine {
 
     /// Advances and reports the current durable frontier.
     pub async fn sync(&self) -> Result<SyncResponse, Error> {
-        let durable_seqno = self.core.lock_state()?.sync();
+        let target_seqno = {
+            let state = self.core.lock_state()?;
+            let target_seqno = state.sync_target_seqno()?;
+            if state.durable_seqno >= target_seqno {
+                return Ok(SyncResponse {
+                    durable_seqno: state.durable_seqno,
+                });
+            }
+            target_seqno
+        };
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.wal_runtime
+            .command_tx
+            .send(WalCommand::Sync {
+                target_seqno,
+                reply: reply_tx,
+            })
+            .map_err(wal_worker_send_error)?;
+
+        let durable_seqno = reply_rx.await.map_err(wal_worker_reply_error)??;
         Ok(SyncResponse { durable_seqno })
     }
 
@@ -275,6 +312,79 @@ impl PezhaiEngine {
             }],
         })
     }
+
+    fn open_with_options(config_path: &Path, options: EngineTestOptions) -> Result<Self, Error> {
+        let config = load_runtime_config(config_path).map_err(Error::from)?;
+        let layout = StoreLayout::from_config_path(config_path);
+        let _ = (layout.config_path(), layout.store_root());
+        fs::create_dir_all(layout.wal_dir()).map_err(Error::Io)?;
+        fs::create_dir_all(layout.meta_dir()).map_err(Error::Io)?;
+        fs::create_dir_all(layout.data_dir()).map_err(Error::Io)?;
+
+        if let Some(current) = read_current(&layout)?
+            && (current.checkpoint_generation != 0
+                || current.checkpoint_max_seqno != 0
+                || current.checkpoint_data_generation != 0)
+        {
+            return Err(Error::Corruption(
+                "CURRENT references metadata checkpoints that are not supported until milestone 4"
+                    .into(),
+            ));
+        }
+
+        let WalRecovery {
+            mutations,
+            last_committed_seqno: _,
+            active_segment,
+        } = recover_wal(&layout, config.wal.segment_bytes)?;
+        let mut state = EngineState::new(config.clone());
+        for recovered in &mutations {
+            state.apply_recovered_mutation(recovered.seqno, &recovered.mutation)?;
+        }
+
+        let writer = WalWriter::open(
+            layout,
+            config.wal.segment_bytes,
+            active_segment,
+            options.wal_writer,
+        )?;
+        let core = Arc::new(EngineCore {
+            state: Mutex::new(state),
+        });
+        let (command_tx, command_rx) = mpsc::channel();
+        let worker_core = Arc::clone(&core);
+        let join_handle = std::thread::Builder::new()
+            .name("pezhai-wal".into())
+            .spawn(move || wal_worker_loop(worker_core, writer, command_rx))
+            .map_err(Error::Io)?;
+
+        Ok(Self {
+            core,
+            wal_runtime: WalRuntime {
+                command_tx,
+                join_handle: Some(join_handle),
+            },
+        })
+    }
+
+    fn shutdown_worker(&mut self) -> Result<(), Error> {
+        let _ = self.wal_runtime.command_tx.send(WalCommand::Shutdown);
+        if let Some(join_handle) = self.wal_runtime.join_handle.take() {
+            join_handle.join().map_err(|_| {
+                Error::Io(std::io::Error::other(
+                    "WAL worker thread panicked during shutdown",
+                ))
+            })?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for PezhaiEngine {
+    fn drop(&mut self) {
+        let _ = self.shutdown_worker();
+    }
 }
 
 struct EngineCore {
@@ -282,13 +392,94 @@ struct EngineCore {
 }
 
 impl EngineCore {
-    // The milestone-1 engine foundation keeps mutation inside a small synchronous critical
-    // section so later durable work can separate admission from delegated I/O.
+    // The direct engine keeps mutation planning inside a short critical section and delegates all
+    // WAL file I/O to the background worker so no durable work happens before suspension.
     fn lock_state(&self) -> Result<MutexGuard<'_, EngineState>, Error> {
         self.state
             .lock()
             .map_err(|_| Error::Corruption("engine state mutex was poisoned".into()))
     }
+}
+
+struct WalRuntime {
+    command_tx: mpsc::Sender<WalCommand>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+enum WalCommand {
+    AppendMutation {
+        seqno: u64,
+        mutation: Mutation,
+        sync_mode: SyncMode,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    Sync {
+        target_seqno: u64,
+        reply: oneshot::Sender<Result<u64, Error>>,
+    },
+    Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EngineTestOptions {
+    wal_writer: WalWriterTestOptions,
+}
+
+fn wal_worker_loop(
+    core: Arc<EngineCore>,
+    mut writer: WalWriter,
+    command_rx: mpsc::Receiver<WalCommand>,
+) {
+    while let Ok(command) = command_rx.recv() {
+        match command {
+            WalCommand::AppendMutation {
+                seqno,
+                mutation,
+                sync_mode,
+                reply,
+            } => {
+                let result = match writer.append_mutation(seqno, &mutation, sync_mode) {
+                    Ok(outcome) => match core.lock_state() {
+                        Ok(mut state) => {
+                            state.apply_live_mutation(seqno, &mutation, outcome.durably_synced)
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => {
+                        if let Ok(mut state) = core.lock_state() {
+                            state.mark_write_failed(error.to_string());
+                        }
+                        Err(error)
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            WalCommand::Sync {
+                target_seqno,
+                reply,
+            } => {
+                let result = match writer.sync_to_current_frontier(target_seqno) {
+                    Ok(durable_seqno) => match core.lock_state() {
+                        Ok(mut state) => {
+                            state.mark_synced(durable_seqno);
+                            Ok(durable_seqno)
+                        }
+                        Err(error) => Err(error),
+                    },
+                    Err(error) => {
+                        if let Ok(mut state) = core.lock_state() {
+                            state.mark_write_failed(error.to_string());
+                        }
+                        Err(error)
+                    }
+                };
+                let _ = reply.send(result);
+            }
+            WalCommand::Shutdown => break,
+        }
+    }
+
+    writer.shutdown();
 }
 
 fn resolve_snapshot(
@@ -365,6 +556,20 @@ fn compare_bound(left: &Bound, right: &Bound) -> i8 {
     }
 }
 
+fn wal_worker_send_error(error: mpsc::SendError<WalCommand>) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!("WAL worker is unavailable: {error}"),
+    ))
+}
+
+fn wal_worker_reply_error(_error: oneshot::error::RecvError) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "WAL worker dropped the reply channel",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -372,14 +577,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{Bound, MAX_KEY_BYTES, MAX_VALUE_BYTES, PezhaiEngine, ScanRange};
+    use super::{
+        Bound, EngineTestOptions, MAX_KEY_BYTES, MAX_VALUE_BYTES, PezhaiEngine, ScanRange,
+    };
+    use crate::pathivu::{CurrentFile, WalWriterTestOptions, build_current_bytes};
     use crate::sevai::{LogicalShardStats, ScanRow, StatsResponse};
 
     static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
 
     #[tokio::test]
     async fn open_stats_and_close_cover_the_empty_store() {
-        let config_path = write_test_config("per_write");
+        let config_path = write_test_config("per_write", None);
         let engine = PezhaiEngine::open(&config_path).unwrap();
 
         let stats = engine.stats().await.unwrap();
@@ -401,18 +609,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn per_write_mode_makes_puts_immediately_durable() {
-        let config_path = write_test_config("per_write");
+    async fn per_write_mode_persists_and_recovers_mutations() {
+        let config_path = write_test_config("per_write", None);
         let engine = PezhaiEngine::open(&config_path).unwrap();
-
         engine.put(b"ant", b"a").await.unwrap();
-        let sync = engine.sync().await.unwrap();
-        assert_eq!(sync.durable_seqno, 1);
+        engine.put(b"bee", b"b").await.unwrap();
+        engine.delete(b"bee").await.unwrap();
+        engine.close().unwrap();
+
+        let reopened = PezhaiEngine::open(&config_path).unwrap();
+        let ant = reopened.get(b"ant", None).await.unwrap();
+        assert_eq!(ant.value, Some(b"a".to_vec()));
+
+        let bee = reopened.get(b"bee", None).await.unwrap();
+        assert!(!bee.found);
+
+        let stats = reopened.stats().await.unwrap();
+        assert_eq!(stats.observation_seqno, 3);
+        assert_eq!(stats.data_generation, 3);
+        reopened.close().unwrap();
     }
 
     #[tokio::test]
     async fn manual_mode_batches_durability_until_sync() {
-        let config_path = write_test_config("manual");
+        let config_path = write_test_config("manual", None);
         let engine = PezhaiEngine::open(&config_path).unwrap();
 
         engine.put(b"ant", b"a").await.unwrap();
@@ -421,11 +641,12 @@ mod tests {
 
         let sync = engine.sync().await.unwrap();
         assert_eq!(sync.durable_seqno, 1);
+        engine.close().unwrap();
     }
 
     #[tokio::test]
     async fn snapshots_keep_reads_and_scans_stable() {
-        let config_path = write_test_config("per_write");
+        let config_path = write_test_config("per_write", None);
         let engine = PezhaiEngine::open(&config_path).unwrap();
 
         engine.put(b"ant", b"v1").await.unwrap();
@@ -461,11 +682,31 @@ mod tests {
             })
         );
         assert_eq!(scan.next().await.unwrap(), None);
+        engine.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn released_snapshots_and_invalid_keys_are_rejected() {
+        let config_path = write_test_config("per_write", None);
+        let engine = PezhaiEngine::open(&config_path).unwrap();
+
+        let snapshot = engine.create_snapshot().await.unwrap();
+        engine.release_snapshot(snapshot.clone()).await.unwrap();
+        let stale_read = engine.get(b"ant", Some(&snapshot)).await.unwrap_err();
+        assert!(
+            stale_read
+                .to_string()
+                .contains("unknown or already released")
+        );
+
+        let empty_key = engine.put(b"", b"value").await.unwrap_err();
+        assert!(empty_key.to_string().contains("key must not be empty"));
+        engine.close().unwrap();
     }
 
     #[tokio::test]
     async fn latest_reads_follow_current_state() {
-        let config_path = write_test_config("per_write");
+        let config_path = write_test_config("per_write", None);
         let engine = PezhaiEngine::open(&config_path).unwrap();
 
         engine.put(b"ant", b"a").await.unwrap();
@@ -488,41 +729,67 @@ mod tests {
         let deleted = engine.get(b"ant", None).await.unwrap();
         assert!(!deleted.found);
         assert_eq!(deleted.value, None);
+        engine.close().unwrap();
     }
 
     #[tokio::test]
-    async fn release_snapshot_rejects_double_release() {
-        let config_path = write_test_config("per_write");
-        let engine = PezhaiEngine::open(&config_path).unwrap();
+    async fn write_failures_stop_future_writes_but_not_reads() {
+        let config_path = write_test_config("per_write", None);
+        let options = EngineTestOptions {
+            wal_writer: WalWriterTestOptions {
+                fail_at_seqno: Some(1),
+            },
+        };
+        let engine = PezhaiEngine::open_with_options(&config_path, options).unwrap();
 
-        let snapshot = engine.create_snapshot().await.unwrap();
-        engine.release_snapshot(snapshot.clone()).await.unwrap();
-        let error = engine.release_snapshot(snapshot).await.unwrap_err();
-        assert!(error.to_string().contains("unknown or already released"));
-    }
+        let error = engine.put(b"ant", b"a").await.unwrap_err();
+        assert!(error.to_string().contains("injected WAL append failure"));
 
-    #[tokio::test]
-    async fn released_snapshots_and_invalid_keys_are_rejected() {
-        let config_path = write_test_config("per_write");
-        let engine = PezhaiEngine::open(&config_path).unwrap();
-
-        let snapshot = engine.create_snapshot().await.unwrap();
-        engine.release_snapshot(snapshot.clone()).await.unwrap();
-        let stale_read = engine.get(b"ant", Some(&snapshot)).await.unwrap_err();
+        let second_write = engine.put(b"bee", b"b").await.unwrap_err();
         assert!(
-            stale_read
+            second_write
                 .to_string()
-                .contains("unknown or already released")
+                .contains("injected WAL append failure")
         );
 
-        let empty_key = engine.put(b"", b"value").await.unwrap_err();
-        assert!(empty_key.to_string().contains("key must not be empty"));
+        let sync_error = engine.sync().await.unwrap_err();
+        assert!(
+            sync_error
+                .to_string()
+                .contains("injected WAL append failure")
+        );
+
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.observation_seqno, 0);
+
+        let snapshot = engine.create_snapshot().await.unwrap();
+        assert_eq!(snapshot.snapshot_seqno(), 0);
+        engine.close().unwrap();
     }
 
     #[test]
-    fn scan_range_rejects_invalid_bounds() {
-        let error = ScanRange::new(Bound::PosInf, Bound::PosInf).unwrap_err();
-        assert!(error.to_string().contains("scan range"));
+    fn open_rejects_current_pointers_to_future_checkpoint_milestones() {
+        let config_path = write_test_config("per_write", None);
+        let current_path = config_path.parent().unwrap().join("CURRENT");
+        fs::write(
+            &current_path,
+            build_current_bytes(CurrentFile {
+                checkpoint_generation: 1,
+                checkpoint_max_seqno: 9,
+                checkpoint_data_generation: 3,
+            }),
+        )
+        .unwrap();
+
+        let error = match PezhaiEngine::open(&config_path) {
+            Ok(_) => panic!("CURRENT-backed opens should be rejected before checkpoint support"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("CURRENT references metadata checkpoints")
+        );
     }
 
     #[test]
@@ -536,26 +803,34 @@ mod tests {
         assert!(value_error.to_string().contains("value exceeds"));
     }
 
-    fn write_test_config(sync_mode: &str) -> PathBuf {
+    #[test]
+    fn scan_range_rejects_invalid_bounds() {
+        let error = ScanRange::new(Bound::PosInf, Bound::PosInf).unwrap_err();
+        assert!(error.to_string().contains("scan range"));
+    }
+
+    fn write_test_config(sync_mode: &str, extra: Option<&str>) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let config_id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("pezhai-engine-{unique}-{config_id}.toml"));
-        fs::write(
-            &path,
-            format!(
-                r#"
+        let root = std::env::temp_dir().join(format!("pezhai-engine-{unique}-{config_id}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
+        let mut contents = format!(
+            r#"
 [engine]
 sync_mode = "{sync_mode}"
 
 [sevai]
 listen_addr = "127.0.0.1:0"
 "#
-            ),
-        )
-        .unwrap();
+        );
+        if let Some(extra) = extra {
+            contents.push_str(extra);
+        }
+        fs::write(&path, contents).unwrap();
         path
     }
 }

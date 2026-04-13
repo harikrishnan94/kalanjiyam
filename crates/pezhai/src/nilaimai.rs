@@ -1,9 +1,10 @@
-//! Mutable engine state scaffolding shared by the direct engine API and future server integration.
+//! Mutable engine state shared by direct engine calls and WAL-driven recovery.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::{RuntimeConfig, SyncMode};
+use crate::error::Error;
 use crate::sevai::{Bound, ScanRow};
 
 /// One visible or tombstoned version for one user key.
@@ -20,15 +21,24 @@ pub(crate) struct SnapshotEntry {
     pub(crate) data_generation: u64,
 }
 
-/// Shared mutable state for the current milestone-1 engine foundation.
+/// One direct-engine mutation that is durable only after its WAL record survives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Mutation {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+/// Shared mutable state for the WAL-backed memtable engine.
 pub(crate) struct EngineState {
     config: RuntimeConfig,
     pub(crate) last_committed_seqno: u64,
     pub(crate) durable_seqno: u64,
     pub(crate) data_generation: u64,
+    next_seqno: u64,
     next_snapshot_id: u64,
     snapshots: HashMap<u64, SnapshotEntry>,
     versions: BTreeMap<Vec<u8>, Vec<ValueVersion>>,
+    write_stop_message: Option<String>,
 }
 
 impl EngineState {
@@ -40,10 +50,61 @@ impl EngineState {
             last_committed_seqno: 0,
             durable_seqno: 0,
             data_generation: 0,
+            next_seqno: 1,
             next_snapshot_id: 1,
             snapshots: HashMap::new(),
             versions: BTreeMap::new(),
+            write_stop_message: None,
         }
+    }
+
+    /// Returns the configured sync mode for live writes.
+    #[must_use]
+    pub(crate) fn sync_mode(&self) -> SyncMode {
+        self.config.engine.sync_mode
+    }
+
+    /// Returns the active write-stop error, if a prior WAL failure poisoned the instance.
+    #[must_use]
+    pub(crate) fn write_stop_error(&self) -> Option<Error> {
+        self.write_stop_message
+            .as_ref()
+            .map(|message| Error::Io(std::io::Error::other(message.clone())))
+    }
+
+    /// Reserves the next mutation sequence number before durable bytes are written.
+    pub(crate) fn reserve_seqno(&mut self) -> Result<u64, Error> {
+        if let Some(error) = self.write_stop_error() {
+            return Err(error);
+        }
+
+        let seqno = self.next_seqno;
+        self.next_seqno += 1;
+        Ok(seqno)
+    }
+
+    /// Applies one recovered mutation that survived WAL replay.
+    pub(crate) fn apply_recovered_mutation(
+        &mut self,
+        seqno: u64,
+        mutation: &Mutation,
+    ) -> Result<(), Error> {
+        self.apply_committed_mutation(seqno, mutation, true)
+    }
+
+    /// Applies one newly appended mutation in commit order.
+    pub(crate) fn apply_live_mutation(
+        &mut self,
+        seqno: u64,
+        mutation: &Mutation,
+        durably_synced: bool,
+    ) -> Result<(), Error> {
+        self.apply_committed_mutation(seqno, mutation, durably_synced)
+    }
+
+    /// Marks the open instance unsafe for further writes after an append/sync failure.
+    pub(crate) fn mark_write_failed(&mut self, message: impl Into<String>) {
+        self.write_stop_message = Some(message.into());
     }
 
     /// Allocates and records one snapshot at the current visible frontier.
@@ -67,29 +128,6 @@ impl EngineState {
     /// Releases one active snapshot entry.
     pub(crate) fn release_snapshot_entry(&mut self, snapshot_id: u64) -> Option<SnapshotEntry> {
         self.snapshots.remove(&snapshot_id)
-    }
-
-    /// Appends one new visible put version to the in-memory state.
-    pub(crate) fn put(&mut self, key: &[u8], value: &[u8]) -> (u64, u64) {
-        let seqno = self.next_seqno();
-        self.versions.entry(key.to_vec()).or_default().insert(
-            0,
-            ValueVersion {
-                seqno,
-                value: Some(value.to_vec()),
-            },
-        );
-        self.publish_write(seqno)
-    }
-
-    /// Appends one tombstone version to the in-memory state.
-    pub(crate) fn delete(&mut self, key: &[u8]) -> (u64, u64) {
-        let seqno = self.next_seqno();
-        self.versions
-            .entry(key.to_vec())
-            .or_default()
-            .insert(0, ValueVersion { seqno, value: None });
-        self.publish_write(seqno)
     }
 
     /// Returns the visible value, if any, for one key at one snapshot sequence number.
@@ -136,23 +174,61 @@ impl EngineState {
             .sum()
     }
 
-    /// Advances the durable frontier to the current committed frontier.
-    pub(crate) fn sync(&mut self) -> u64 {
-        self.durable_seqno = self.last_committed_seqno;
-        self.durable_seqno
+    /// Advances the durable frontier after a successful explicit `sync()`.
+    pub(crate) fn mark_synced(&mut self, durable_seqno: u64) {
+        self.durable_seqno = self.durable_seqno.max(durable_seqno);
     }
 
-    fn next_seqno(&mut self) -> u64 {
-        self.last_committed_seqno += 1;
-        self.last_committed_seqno
+    /// Returns the current committed frontier for `sync()`.
+    pub(crate) fn sync_target_seqno(&self) -> Result<u64, Error> {
+        if let Some(error) = self.write_stop_error() {
+            return Err(error);
+        }
+
+        Ok(self.last_committed_seqno)
     }
 
-    fn publish_write(&mut self, seqno: u64) -> (u64, u64) {
+    fn apply_committed_mutation(
+        &mut self,
+        seqno: u64,
+        mutation: &Mutation,
+        durably_synced: bool,
+    ) -> Result<(), Error> {
+        let expected_seqno = self.last_committed_seqno + 1;
+        if seqno != expected_seqno {
+            return Err(Error::Corruption(format!(
+                "mutation seqno {seqno} was committed out of order; expected {expected_seqno}"
+            )));
+        }
+
+        match mutation {
+            Mutation::Put { key, value } => {
+                self.versions.entry(key.clone()).or_default().insert(
+                    0,
+                    ValueVersion {
+                        seqno,
+                        value: Some(value.clone()),
+                    },
+                );
+            }
+            Mutation::Delete { key } => {
+                self.versions
+                    .entry(key.clone())
+                    .or_default()
+                    .insert(0, ValueVersion { seqno, value: None });
+            }
+        }
+
+        self.last_committed_seqno = seqno;
         self.data_generation += 1;
-        if self.config.engine.sync_mode == SyncMode::PerWrite {
+        if durably_synced {
             self.durable_seqno = seqno;
         }
-        (seqno, self.data_generation)
+        if self.next_seqno <= seqno {
+            self.next_seqno = seqno + 1;
+        }
+
+        Ok(())
     }
 }
 
