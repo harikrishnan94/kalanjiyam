@@ -1,17 +1,19 @@
 //! Immutable read and maintenance execution helpers for the shared-data engine.
 
+use std::cmp::Ordering as CmpOrdering;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
 use crate::idam::StoreLayout;
 use crate::nilaimai::{
     CompactionBuildResult, CompactionPlan, FlushBuildResult, FlushPlan, InternalRecord,
-    MemtableRef, PointReadPlan, ScanPlan, lock_memtable, visible_scan_rows,
+    LogicalMaintenancePlan, LogicalShardEntry, LogicalShardInstallPayload, MemtableRef,
+    PointReadPlan, ScanPlan, lock_memtable, visible_scan_rows,
 };
 use crate::pathivu::{
     build_temp_data_file, find_visible_record_in_data_file, load_data_file_records,
 };
-use crate::sevai::ScanRow;
+use crate::sevai::{Bound, ScanRow};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -109,10 +111,163 @@ pub(crate) fn build_compaction_output(
     Ok(CompactionBuildResult { temp_path, summary })
 }
 
+/// Recomputes exact live bytes for the current logical-shard map and chooses at most one install.
+pub(crate) fn execute_logical_maintenance_plan(
+    layout: &StoreLayout,
+    plan: &LogicalMaintenancePlan,
+) -> Result<Option<LogicalShardInstallPayload>, Error> {
+    let rows = execute_scan_plan(layout, &plan.scan_plan)?;
+    let exact_bytes = exact_live_bytes_by_shard(&plan.current_logical_shards, &rows)?;
+
+    for (index, shard) in plan.current_logical_shards.iter().enumerate() {
+        let total_bytes = exact_bytes[index];
+        if total_bytes < plan.logical_split_bytes {
+            continue;
+        }
+
+        let Some(boundary) = choose_split_boundary(shard, &rows, total_bytes) else {
+            continue;
+        };
+
+        let left_bytes = rows
+            .iter()
+            .filter(|row| shard.contains_key(&row.key) && row.key.as_slice() < boundary.as_slice())
+            .map(logical_row_bytes)
+            .sum::<u64>();
+        let right_bytes = total_bytes.saturating_sub(left_bytes);
+
+        return Ok(Some(LogicalShardInstallPayload {
+            source_entries: vec![shard.clone()],
+            output_entries: vec![
+                LogicalShardEntry::new(
+                    shard.start_bound.clone(),
+                    Bound::Finite(boundary.clone()),
+                    left_bytes,
+                )?,
+                LogicalShardEntry::new(
+                    Bound::Finite(boundary),
+                    shard.end_bound.clone(),
+                    right_bytes,
+                )?,
+            ],
+        }));
+    }
+
+    let mut best_merge: Option<(usize, u64)> = None;
+    for index in 0..plan.current_logical_shards.len().saturating_sub(1) {
+        let combined = exact_bytes[index].saturating_add(exact_bytes[index + 1]);
+        if combined > plan.logical_merge_bytes {
+            continue;
+        }
+
+        match best_merge {
+            None => best_merge = Some((index, combined)),
+            Some((best_index, best_combined)) => {
+                let ordering = combined
+                    .cmp(&best_combined)
+                    .then_with(|| index.cmp(&best_index));
+                if ordering == CmpOrdering::Less {
+                    best_merge = Some((index, combined));
+                }
+            }
+        }
+    }
+
+    let Some((merge_index, combined_bytes)) = best_merge else {
+        return Ok(None);
+    };
+    let left = &plan.current_logical_shards[merge_index];
+    let right = &plan.current_logical_shards[merge_index + 1];
+    Ok(Some(LogicalShardInstallPayload {
+        source_entries: vec![left.clone(), right.clone()],
+        output_entries: vec![LogicalShardEntry::new(
+            left.start_bound.clone(),
+            right.end_bound.clone(),
+            combined_bytes,
+        )?],
+    }))
+}
+
+/// Deletes the requested canonical data files in stable order and keeps failures best-effort.
+pub(crate) fn execute_gc(layout: &StoreLayout, file_ids: &[u64]) -> Vec<u64> {
+    let mut deleted = Vec::new();
+    for file_id in file_ids {
+        match std::fs::remove_file(layout.data_file_path(*file_id)) {
+            Ok(()) => deleted.push(*file_id),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+    }
+    deleted
+}
+
 fn collect_memtable_records(
     memtable: &MemtableRef,
     start_bound: &crate::sevai::Bound,
     end_bound: &crate::sevai::Bound,
 ) -> Result<Vec<InternalRecord>, Error> {
     Ok(lock_memtable(memtable)?.collect_internal_records(start_bound, end_bound))
+}
+
+// Logical maintenance recomputes exact live bytes from the latest visible rows
+// rather than tracking old-value deltas on the write path.
+fn exact_live_bytes_by_shard(
+    shards: &[LogicalShardEntry],
+    rows: &[ScanRow],
+) -> Result<Vec<u64>, Error> {
+    let mut exact_bytes = vec![0_u64; shards.len()];
+    let mut shard_index = 0_usize;
+
+    for row in rows {
+        while shard_index < shards.len() && !shards[shard_index].contains_key(&row.key) {
+            shard_index += 1;
+        }
+        if shard_index == shards.len() {
+            return Err(Error::Corruption(
+                "latest visible rows no longer fit inside the captured logical-shard map".into(),
+            ));
+        }
+        exact_bytes[shard_index] = exact_bytes[shard_index].saturating_add(logical_row_bytes(row));
+    }
+
+    Ok(exact_bytes)
+}
+
+// The split chooser follows the handoff default: walk one shard in key order
+// and pick the first key where the running exact-byte total crosses half.
+fn choose_split_boundary(
+    shard: &LogicalShardEntry,
+    rows: &[ScanRow],
+    total_bytes: u64,
+) -> Option<Vec<u8>> {
+    let mut cumulative_bytes = 0_u64;
+    for row in rows.iter().filter(|row| shard.contains_key(&row.key)) {
+        cumulative_bytes = cumulative_bytes.saturating_add(logical_row_bytes(row));
+        if cumulative_bytes.saturating_mul(2) < total_bytes {
+            continue;
+        }
+
+        let boundary = row.key.clone();
+        let valid_left = match &shard.start_bound {
+            Bound::NegInf => true,
+            Bound::Finite(start) => start.as_slice() < boundary.as_slice(),
+            Bound::PosInf => false,
+        };
+        let valid_right = match &shard.end_bound {
+            Bound::Finite(end) => boundary.as_slice() < end.as_slice(),
+            Bound::PosInf => true,
+            Bound::NegInf => false,
+        };
+        if valid_left && valid_right {
+            return Some(boundary);
+        }
+    }
+
+    None
+}
+
+// One visible row contributes exactly `len(key) + len(value)` logical bytes to
+// the latest-only shard metadata.
+fn logical_row_bytes(row: &ScanRow) -> u64 {
+    (row.key.len() + row.value.len()) as u64
 }

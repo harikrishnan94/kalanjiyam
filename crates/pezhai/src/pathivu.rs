@@ -10,8 +10,8 @@ use crate::error::Error;
 use crate::idam::StoreLayout;
 use crate::nilaimai::{
     BuiltDataFileSummary, CompactPublishPayload, FileMeta, FlushPublishPayload, InternalRecord,
-    ManifestLevelView, Mutation, RecordKind, compare_internal, compare_internal_to_parts,
-    key_in_range,
+    LogicalShardEntry, LogicalShardInstallPayload, ManifestLevelView, Mutation, RecordKind,
+    compare_internal, compare_internal_to_parts, key_in_range,
 };
 use crate::sevai::Bound;
 
@@ -40,16 +40,24 @@ const RECORD_MAGIC: &[u8; 4] = b"KJWR";
 
 const KJM_HEADER_BYTES: usize = 128;
 const KJM_FOOTER_BYTES: usize = 128;
+const KJM_METADATA_HEADER_BYTES: usize = 192;
 const KJM_HEADER_MAGIC: &[u8; 8] = b"KJKJM001";
 const KJM_FOOTER_MAGIC: &[u8; 8] = b"KJKJMF01";
 const FILE_KIND_DATA: u16 = 1;
+const FILE_KIND_METADATA_CHECKPOINT: u16 = 2;
 const BLOCK_KIND_DATA_LEAF: u8 = 2;
+const BLOCK_KIND_FILE_MANIFEST: u8 = 3;
+const BLOCK_KIND_LOGICAL_SHARD: u8 = 4;
 const FILE_META_FIXED_BYTES: usize = 60;
+const LOGICAL_SHARD_ENTRY_FIXED_BYTES: usize = 24;
+const METADATA_BLOCK_FIXED_BYTES: usize = 64;
+const METADATA_BLOCK_SLOT_BYTES: usize = 8;
 
 const WAL_RECORD_PUT: u8 = 1;
 const WAL_RECORD_DELETE: u8 = 2;
 const WAL_RECORD_FLUSH_PUBLISH: u8 = 3;
 const WAL_RECORD_COMPACT_PUBLISH: u8 = 4;
+const WAL_RECORD_LOGICAL_SHARD_INSTALL: u8 = 5;
 
 /// One parsed `CURRENT` pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +65,18 @@ pub(crate) struct CurrentFile {
     pub(crate) checkpoint_generation: u64,
     pub(crate) checkpoint_max_seqno: u64,
     pub(crate) checkpoint_data_generation: u64,
+}
+
+/// One replay seed loaded from a durable checkpoint before WAL replay begins.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReplaySeed {
+    pub(crate) checkpoint_generation: u64,
+    pub(crate) checkpoint_max_seqno: u64,
+    pub(crate) checkpoint_data_generation: u64,
+    pub(crate) next_seqno: u64,
+    pub(crate) next_file_id: u64,
+    pub(crate) levels: Vec<ManifestLevelView>,
+    pub(crate) logical_shards: Vec<LogicalShardEntry>,
 }
 
 /// One recovered mutation that survived WAL replay and was not covered by a publish record.
@@ -82,6 +102,7 @@ pub(crate) struct RecoveredActiveSegment {
 pub(crate) struct WalRecovery {
     pub(crate) pending_mutations: Vec<RecoveredMutation>,
     pub(crate) levels: Vec<ManifestLevelView>,
+    pub(crate) logical_shards: Vec<LogicalShardEntry>,
     pub(crate) last_committed_seqno: u64,
     pub(crate) data_generation: u64,
     pub(crate) next_file_id: u64,
@@ -122,6 +143,7 @@ enum WalRecordBody {
     Mutation(Mutation),
     FlushPublish(FlushPublishPayload),
     CompactPublish(CompactPublishPayload),
+    LogicalShardInstall(LogicalShardInstallPayload),
 }
 
 struct DecodedWalRecord {
@@ -132,6 +154,16 @@ struct DecodedWalRecord {
 struct DecodedDataFile {
     summary: BuiltDataFileSummary,
     records: Vec<InternalRecord>,
+}
+
+struct DecodedMetadataCheckpoint {
+    checkpoint_generation: u64,
+    checkpoint_max_seqno: u64,
+    checkpoint_data_generation: u64,
+    next_seqno: u64,
+    next_file_id: u64,
+    levels: Vec<ManifestLevelView>,
+    logical_shards: Vec<LogicalShardEntry>,
 }
 
 /// Computes the CRC32C checksum mandated by the storage-engine specification.
@@ -200,8 +232,176 @@ pub(crate) fn build_current_bytes(current: CurrentFile) -> [u8; CURRENT_BYTES] {
     bytes
 }
 
+/// Reads and validates one metadata checkpoint named by `CURRENT`.
+pub(crate) fn read_metadata_checkpoint(
+    layout: &StoreLayout,
+    checkpoint_generation: u64,
+) -> Result<ReplaySeed, Error> {
+    let decoded = read_metadata_checkpoint_file(
+        &layout.meta_file_path(checkpoint_generation),
+        checkpoint_generation,
+    )?;
+    let mut used_file_ids = BTreeSet::new();
+    let all_files = decoded
+        .levels
+        .iter()
+        .flat_map(|level| level.files.iter().cloned())
+        .collect::<Vec<_>>();
+    validate_output_file_metas(layout, &all_files, &mut used_file_ids)?;
+    Ok(ReplaySeed {
+        checkpoint_generation: decoded.checkpoint_generation,
+        checkpoint_max_seqno: decoded.checkpoint_max_seqno,
+        checkpoint_data_generation: decoded.checkpoint_data_generation,
+        next_seqno: decoded.next_seqno,
+        next_file_id: decoded.next_file_id,
+        levels: decoded.levels,
+        logical_shards: decoded.logical_shards,
+    })
+}
+
+/// Builds and fsyncs one temporary metadata checkpoint file.
+pub(crate) fn build_temp_metadata_checkpoint_file(
+    layout: &StoreLayout,
+    page_size_bytes: u32,
+    checkpoint: &ReplaySeed,
+    temp_tag: &str,
+) -> Result<PathBuf, Error> {
+    let temp_path = layout.temp_meta_file_path(temp_tag);
+    let bytes = build_metadata_checkpoint_bytes(page_size_bytes, checkpoint)?;
+    if let Some(parent) = temp_path.parent() {
+        fs::create_dir_all(parent).map_err(Error::Io)?;
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(Error::Io)?;
+    file.write_all(&bytes).map_err(Error::Io)?;
+    file.sync_all().map_err(Error::Io)?;
+    Ok(temp_path)
+}
+
+/// Renames one fully synced metadata checkpoint temp file into its canonical durable path.
+pub(crate) fn install_metadata_checkpoint(
+    layout: &StoreLayout,
+    temp_path: &Path,
+    checkpoint_generation: u64,
+) -> Result<PathBuf, Error> {
+    let canonical_path = layout.meta_file_path(checkpoint_generation);
+    fs::rename(temp_path, &canonical_path).map_err(Error::Io)?;
+    sync_directory(layout.meta_dir())?;
+    Ok(canonical_path)
+}
+
+/// Installs one fully synced `CURRENT` file body using the spec's temp-file protocol.
+pub(crate) fn install_current(
+    layout: &StoreLayout,
+    current: CurrentFile,
+    temp_tag: &str,
+) -> Result<(), Error> {
+    let temp_path = layout.temp_current_path(temp_tag);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(Error::Io)?;
+    file.write_all(&build_current_bytes(current))
+        .map_err(Error::Io)?;
+    file.sync_all().map_err(Error::Io)?;
+    drop(file);
+    fs::rename(&temp_path, layout.current_path()).map_err(Error::Io)?;
+    sync_directory(layout.store_root())?;
+    Ok(())
+}
+
+/// Returns the retained WAL bytes still newer than one durable checkpoint frontier.
+pub(crate) fn retained_wal_bytes_after(
+    layout: &StoreLayout,
+    checkpoint_max_seqno: u64,
+) -> Result<u64, Error> {
+    let mut total = 0_u64;
+    for entry in fs::read_dir(layout.wal_dir()).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(parsed_name) = parse_wal_file_name(file_name) else {
+            continue;
+        };
+        let should_count = match parsed_name.last_seqno {
+            Some(last_seqno) => last_seqno > checkpoint_max_seqno,
+            None => true,
+        };
+        if should_count {
+            total = total.saturating_add(entry.metadata().map_err(Error::Io)?.len());
+        }
+    }
+    Ok(total)
+}
+
+/// Deletes every covered closed WAL segment in stable filename order and keeps failures best-effort.
+pub(crate) fn truncate_covered_closed_wal_segments(
+    layout: &StoreLayout,
+    checkpoint_max_seqno: u64,
+) -> Result<(), Error> {
+    let mut eligible = Vec::new();
+    for entry in fs::read_dir(layout.wal_dir()).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(parsed_name) = parse_wal_file_name(file_name) else {
+            continue;
+        };
+        if parsed_name.is_open {
+            continue;
+        }
+        if let Some(last_seqno) = parsed_name.last_seqno
+            && last_seqno <= checkpoint_max_seqno
+        {
+            eligible.push((file_name.to_string(), entry.path()));
+        }
+    }
+
+    eligible.sort_by(|left, right| left.0.cmp(&right.0));
+    for (_name, path) in eligible {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
+/// Lists the canonical shared-data files currently present on disk in stable filename order.
+pub(crate) fn list_canonical_data_file_ids(layout: &StoreLayout) -> Result<Vec<u64>, Error> {
+    let mut file_ids = Vec::new();
+    for entry in fs::read_dir(layout.data_dir()).map_err(Error::Io)? {
+        let entry = entry.map_err(Error::Io)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        let Some(file_id) = parse_data_file_name(file_name) else {
+            continue;
+        };
+        file_ids.push(file_id);
+    }
+    file_ids.sort_unstable();
+    Ok(file_ids)
+}
+
 /// Discovers WAL files, replays publish records, and reconstructs the latest manifest state.
-pub(crate) fn recover_wal(layout: &StoreLayout, segment_bytes: u64) -> Result<WalRecovery, Error> {
+pub(crate) fn recover_wal(
+    layout: &StoreLayout,
+    segment_bytes: u64,
+    replay_seed: Option<&ReplaySeed>,
+) -> Result<WalRecovery, Error> {
     fs::create_dir_all(layout.wal_dir()).map_err(Error::Io)?;
     let mut discovered = Vec::new();
 
@@ -224,11 +424,36 @@ pub(crate) fn recover_wal(layout: &StoreLayout, segment_bytes: u64) -> Result<Wa
             .then(left.0.is_open.cmp(&right.0.is_open))
     });
 
+    let replay_start_seqno = replay_seed
+        .map(|seed| seed.checkpoint_max_seqno.saturating_add(1))
+        .unwrap_or(1);
+    let start_index = discovered
+        .iter()
+        .position(|(name, _path)| wal_segment_may_contain_seqno(name, replay_start_seqno))
+        .unwrap_or(discovered.len());
+    if let Some((name, _path)) = discovered.get(start_index)
+        && name.first_seqno != NONE_U64
+        && name.first_seqno > replay_start_seqno
+    {
+        return Err(Error::Corruption(
+            "WAL replay could not find a segment covering the checkpoint frontier".into(),
+        ));
+    }
+
     let mut active_segment = None;
     let mut records = Vec::new();
-    let mut expected_seqno = 1_u64;
+    let mut expected_seqno = discovered
+        .get(start_index)
+        .map(|(name, _path)| {
+            if name.first_seqno == NONE_U64 {
+                replay_start_seqno
+            } else {
+                name.first_seqno
+            }
+        })
+        .unwrap_or(replay_start_seqno);
 
-    for (name, path) in discovered {
+    for (name, path) in discovered.into_iter().skip(start_index) {
         if name.is_open {
             if active_segment.is_some() {
                 return Err(Error::Corruption(
@@ -248,13 +473,25 @@ pub(crate) fn recover_wal(layout: &StoreLayout, segment_bytes: u64) -> Result<Wa
     }
 
     let mut pending_mutations = Vec::new();
-    let mut levels = Vec::<ManifestLevelView>::new();
-    let mut used_file_ids = BTreeSet::<u64>::new();
-    let mut last_committed_seqno = 0;
-    let mut data_generation = 0;
-    let mut next_file_id = 1;
+    let mut levels = replay_seed
+        .map(|seed| seed.levels.clone())
+        .unwrap_or_default();
+    let mut logical_shards = replay_seed
+        .map(|seed| seed.logical_shards.clone())
+        .unwrap_or_else(|| vec![full_keyspace_logical_shard()]);
+    let mut used_file_ids = collect_used_file_ids(&levels);
+    let mut last_committed_seqno = replay_seed
+        .map(|seed| seed.checkpoint_max_seqno)
+        .unwrap_or(0);
+    let mut data_generation = replay_seed
+        .map(|seed| seed.checkpoint_data_generation)
+        .unwrap_or(0);
+    let mut next_file_id = replay_seed.map(|seed| seed.next_file_id).unwrap_or(1);
 
     for record in records {
+        if record.seqno < replay_start_seqno {
+            continue;
+        }
         last_committed_seqno = record.seqno;
         match record.body {
             WalRecordBody::Mutation(mutation) => {
@@ -282,12 +519,16 @@ pub(crate) fn recover_wal(layout: &StoreLayout, segment_bytes: u64) -> Result<Wa
                 data_generation += 1;
                 next_file_id = next_file_id.max(max_output_file_id(&payload.output_file_metas) + 1);
             }
+            WalRecordBody::LogicalShardInstall(payload) => {
+                apply_replay_logical_install(&mut logical_shards, &payload)?;
+            }
         }
     }
 
     Ok(WalRecovery {
         pending_mutations,
         levels,
+        logical_shards,
         last_committed_seqno,
         data_generation,
         next_file_id,
@@ -351,6 +592,20 @@ impl WalWriter {
         self.append_record(
             seqno,
             WalRecordBody::CompactPublish(payload.clone()),
+            sync_mode,
+        )
+    }
+
+    /// Appends one `LogicalShardInstall` record to the WAL.
+    pub(crate) fn append_logical_shard_install(
+        &mut self,
+        seqno: u64,
+        payload: &LogicalShardInstallPayload,
+        sync_mode: SyncMode,
+    ) -> Result<AppendOutcome, Error> {
+        self.append_record(
+            seqno,
+            WalRecordBody::LogicalShardInstall(payload.clone()),
             sync_mode,
         )
     }
@@ -887,9 +1142,12 @@ fn try_parse_record(
         WAL_RECORD_COMPACT_PUBLISH => {
             WalRecordBody::CompactPublish(decode_compact_publish_payload(payload)?)
         }
+        WAL_RECORD_LOGICAL_SHARD_INSTALL => {
+            WalRecordBody::LogicalShardInstall(decode_logical_shard_install_payload(payload)?)
+        }
         record_type => {
             return Err(Error::Corruption(format!(
-                "WAL record type {record_type} is not supported by milestone 3 replay"
+                "WAL record type {record_type} is not supported by replay"
             )));
         }
     };
@@ -1043,6 +1301,56 @@ fn decode_compact_publish_payload(payload: &[u8]) -> Result<CompactPublishPayloa
     })
 }
 
+fn decode_logical_shard_install_payload(
+    payload: &[u8],
+) -> Result<LogicalShardInstallPayload, Error> {
+    if payload.len() < 8 {
+        return Err(Error::Corruption(
+            "LogicalShardInstall payload was too short".into(),
+        ));
+    }
+
+    let source_entry_count = read_u16(payload, 0) as usize;
+    let output_entry_count = read_u16(payload, 2) as usize;
+    if read_u32(payload, 4) != 8 {
+        return Err(Error::Corruption(
+            "LogicalShardInstall fixed_bytes was invalid".into(),
+        ));
+    }
+    if !(1..=2).contains(&source_entry_count) || !(1..=2).contains(&output_entry_count) {
+        return Err(Error::Corruption(
+            "LogicalShardInstall entry counts must be 1 or 2".into(),
+        ));
+    }
+
+    let mut offset = 8;
+    let mut source_entries = Vec::with_capacity(source_entry_count);
+    for _ in 0..source_entry_count {
+        let (entry, next_offset) = decode_logical_shard_entry_wire(payload, offset)?;
+        source_entries.push(entry);
+        offset = next_offset;
+    }
+
+    let mut output_entries = Vec::with_capacity(output_entry_count);
+    for _ in 0..output_entry_count {
+        let (entry, next_offset) = decode_logical_shard_entry_wire(payload, offset)?;
+        output_entries.push(entry);
+        offset = next_offset;
+    }
+    if offset != payload.len() {
+        return Err(Error::Corruption(
+            "LogicalShardInstall payload contained trailing bytes".into(),
+        ));
+    }
+
+    validate_logical_shard_install_entries(&source_entries, &output_entries)?;
+
+    Ok(LogicalShardInstallPayload {
+        source_entries,
+        output_entries,
+    })
+}
+
 fn encode_wal_record(seqno: u64, record: &WalRecordBody) -> Result<Vec<u8>, Error> {
     let (record_type, payload) = match record {
         WalRecordBody::Mutation(mutation) => encode_mutation_payload(mutation)?,
@@ -1053,6 +1361,10 @@ fn encode_wal_record(seqno: u64, record: &WalRecordBody) -> Result<Vec<u8>, Erro
         WalRecordBody::CompactPublish(payload) => (
             WAL_RECORD_COMPACT_PUBLISH,
             encode_compact_publish_payload(payload)?,
+        ),
+        WalRecordBody::LogicalShardInstall(payload) => (
+            WAL_RECORD_LOGICAL_SHARD_INSTALL,
+            encode_logical_shard_install_payload(payload)?,
         ),
     };
 
@@ -1138,6 +1450,24 @@ fn encode_compact_publish_payload(payload: &CompactPublishPayload) -> Result<Vec
     Ok(bytes)
 }
 
+fn encode_logical_shard_install_payload(
+    payload: &LogicalShardInstallPayload,
+) -> Result<Vec<u8>, Error> {
+    validate_logical_shard_install_entries(&payload.source_entries, &payload.output_entries)?;
+
+    let mut bytes = vec![0_u8; 8];
+    bytes[0..2].copy_from_slice(&(payload.source_entries.len() as u16).to_le_bytes());
+    bytes[2..4].copy_from_slice(&(payload.output_entries.len() as u16).to_le_bytes());
+    bytes[4..8].copy_from_slice(&8_u32.to_le_bytes());
+    for entry in &payload.source_entries {
+        bytes.extend_from_slice(&encode_logical_shard_entry_wire(entry)?);
+    }
+    for entry in &payload.output_entries {
+        bytes.extend_from_slice(&encode_logical_shard_entry_wire(entry)?);
+    }
+    Ok(bytes)
+}
+
 fn encode_file_meta_wire(file_meta: &FileMeta) -> Result<Vec<u8>, Error> {
     if file_meta.file_id == 0
         || file_meta.min_user_key.is_empty()
@@ -1214,6 +1544,110 @@ fn decode_file_meta_wire(bytes: &[u8], offset: usize) -> Result<(FileMeta, usize
     Ok((file_meta, offset + total_bytes))
 }
 
+// Logical-shard wire entries reuse the common Bound encoding so WAL replay and
+// metadata checkpoints validate the same latest-only shard shape.
+fn encode_logical_shard_entry_wire(entry: &LogicalShardEntry) -> Result<Vec<u8>, Error> {
+    validate_logical_shard_entry(entry)?;
+    let start_bytes = encode_bound_wire(&entry.start_bound)?;
+    let end_bytes = encode_bound_wire(&entry.end_bound)?;
+    let mut bytes = vec![0_u8; LOGICAL_SHARD_ENTRY_FIXED_BYTES];
+    bytes[0..8].copy_from_slice(&entry.live_size_bytes.to_le_bytes());
+    bytes[8..12].copy_from_slice(&(start_bytes.len() as u32).to_le_bytes());
+    bytes[12..16].copy_from_slice(&(end_bytes.len() as u32).to_le_bytes());
+    bytes[16..20].copy_from_slice(&(LOGICAL_SHARD_ENTRY_FIXED_BYTES as u32).to_le_bytes());
+    bytes.extend_from_slice(&start_bytes);
+    bytes.extend_from_slice(&end_bytes);
+    Ok(bytes)
+}
+
+fn decode_logical_shard_entry_wire(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<(LogicalShardEntry, usize), Error> {
+    if offset + LOGICAL_SHARD_ENTRY_FIXED_BYTES > bytes.len() {
+        return Err(Error::Corruption(
+            "LogicalShardEntryWire was truncated".into(),
+        ));
+    }
+
+    let start_bound_bytes = read_u32(bytes, offset + 8) as usize;
+    let end_bound_bytes = read_u32(bytes, offset + 12) as usize;
+    if read_u32(bytes, offset + 16) != LOGICAL_SHARD_ENTRY_FIXED_BYTES as u32
+        || read_u32(bytes, offset + 20) != 0
+    {
+        return Err(Error::Corruption(
+            "LogicalShardEntryWire fixed bytes were invalid".into(),
+        ));
+    }
+
+    let total_bytes = LOGICAL_SHARD_ENTRY_FIXED_BYTES + start_bound_bytes + end_bound_bytes;
+    if offset + total_bytes > bytes.len() {
+        return Err(Error::Corruption(
+            "LogicalShardEntryWire lengths were invalid".into(),
+        ));
+    }
+
+    let start_offset = offset + LOGICAL_SHARD_ENTRY_FIXED_BYTES;
+    let start_end = start_offset + start_bound_bytes;
+    let end_end = start_end + end_bound_bytes;
+    let (start_bound, decoded_start_end) = decode_bound_wire(bytes, start_offset)?;
+    let (end_bound, decoded_end_end) = decode_bound_wire(bytes, start_end)?;
+    if decoded_start_end != start_end || decoded_end_end != end_end {
+        return Err(Error::Corruption(
+            "LogicalShardEntryWire bound lengths were inconsistent".into(),
+        ));
+    }
+
+    let entry = LogicalShardEntry::new(start_bound, end_bound, read_u64(bytes, offset))
+        .map_err(|error| Error::Corruption(error.to_string()))?;
+    Ok((entry, offset + total_bytes))
+}
+
+fn encode_bound_wire(bound: &Bound) -> Result<Vec<u8>, Error> {
+    match bound {
+        Bound::Finite(key) => {
+            if key.is_empty() || key.len() > MAX_KEY_BYTES {
+                return Err(Error::Corruption(
+                    "BoundWire finite keys must be in the range 1..=1024 bytes".into(),
+                ));
+            }
+            let mut bytes = vec![0_u8; 3 + key.len()];
+            bytes[1..3].copy_from_slice(&(key.len() as u16).to_le_bytes());
+            bytes[3..].copy_from_slice(key);
+            Ok(bytes)
+        }
+        Bound::NegInf => Ok(vec![1]),
+        Bound::PosInf => Ok(vec![2]),
+    }
+}
+
+fn decode_bound_wire(bytes: &[u8], offset: usize) -> Result<(Bound, usize), Error> {
+    let Some(bound_kind) = bytes.get(offset) else {
+        return Err(Error::Corruption("BoundWire was truncated".into()));
+    };
+
+    match *bound_kind {
+        0 => {
+            if offset + 3 > bytes.len() {
+                return Err(Error::Corruption("BoundWire was truncated".into()));
+            }
+            let key_len = read_u16(bytes, offset + 1) as usize;
+            if !(1..=MAX_KEY_BYTES).contains(&key_len) || offset + 3 + key_len > bytes.len() {
+                return Err(Error::Corruption("BoundWire key length was invalid".into()));
+            }
+            Ok((
+                Bound::Finite(bytes[offset + 3..offset + 3 + key_len].to_vec()),
+                offset + 3 + key_len,
+            ))
+        }
+        1 => Ok((Bound::NegInf, offset + 1)),
+        2 => Ok((Bound::PosInf, offset + 1)),
+        other => Err(Error::Corruption(format!(
+            "BoundWire kind {other} was invalid"
+        ))),
+    }
+}
+
 fn build_segment_header(first_seqno: u64, segment_bytes: u64) -> [u8; SEGMENT_HEADER_BYTES] {
     let mut bytes = [0_u8; SEGMENT_HEADER_BYTES];
     bytes[0..8].copy_from_slice(SEGMENT_HEADER_MAGIC);
@@ -1280,6 +1714,205 @@ fn build_data_file_footer(summary: &BuiltDataFileSummary) -> [u8; KJM_FOOTER_BYT
     let crc = crc32c(&zeroed_crc_field(&bytes, 80..84));
     bytes[80..84].copy_from_slice(&crc.to_le_bytes());
     bytes
+}
+
+// Metadata checkpoints persist the current file-only manifest plus the current
+// logical-shard map in one `.kjm` list-file so `open()` can replay from a
+// compact durable frontier.
+fn build_metadata_checkpoint_bytes(
+    page_size_bytes: u32,
+    checkpoint: &ReplaySeed,
+) -> Result<Vec<u8>, Error> {
+    if !page_size_bytes.is_power_of_two() || !(4096..=32768).contains(&page_size_bytes) {
+        return Err(Error::InvalidArgument(
+            "page_size_bytes must be a power of two in 4096..=32768".into(),
+        ));
+    }
+    validate_logical_shard_entries(
+        &checkpoint.logical_shards,
+        "metadata checkpoint logical shards",
+    )?;
+
+    let mut manifest_entries = checkpoint
+        .levels
+        .iter()
+        .flat_map(|level| level.files.iter().cloned())
+        .collect::<Vec<_>>();
+    manifest_entries.sort_by(|left, right| {
+        left.level_no
+            .cmp(&right.level_no)
+            .then(left.file_id.cmp(&right.file_id))
+    });
+    let manifest_value_bytes = manifest_entries
+        .iter()
+        .map(encode_file_meta_wire)
+        .collect::<Result<Vec<_>, _>>()?;
+    let logical_value_bytes = checkpoint
+        .logical_shards
+        .iter()
+        .map(encode_logical_shard_entry_wire)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let manifest_block = (!manifest_value_bytes.is_empty())
+        .then(|| {
+            build_metadata_block(
+                page_size_bytes as usize,
+                BLOCK_KIND_FILE_MANIFEST,
+                &manifest_value_bytes,
+                NONE_U64,
+            )
+        })
+        .transpose()?;
+    let logical_block = (!logical_value_bytes.is_empty())
+        .then(|| {
+            build_metadata_block(
+                page_size_bytes as usize,
+                BLOCK_KIND_LOGICAL_SHARD,
+                &logical_value_bytes,
+                NONE_U64,
+            )
+        })
+        .transpose()?;
+
+    let block_count = u64::from(manifest_block.is_some()) + u64::from(logical_block.is_some());
+    let entry_count = (manifest_entries.len() + checkpoint.logical_shards.len()) as u64;
+    let physical_bytes = page_size_bytes as usize
+        + manifest_block.as_ref().map_or(0, Vec::len)
+        + logical_block.as_ref().map_or(0, Vec::len)
+        + KJM_FOOTER_BYTES;
+    let header = build_metadata_checkpoint_header(
+        page_size_bytes,
+        checkpoint,
+        manifest_entries.len() as u32,
+        checkpoint.logical_shards.len() as u32,
+        block_count,
+        entry_count,
+        physical_bytes as u64,
+    );
+    let footer = build_metadata_checkpoint_footer(
+        checkpoint,
+        block_count,
+        entry_count,
+        physical_bytes as u64,
+    );
+
+    let mut bytes = vec![0_u8; physical_bytes];
+    bytes[0..KJM_METADATA_HEADER_BYTES].copy_from_slice(&header);
+    let mut offset = page_size_bytes as usize;
+    if let Some(manifest_block) = manifest_block {
+        bytes[offset..offset + manifest_block.len()].copy_from_slice(&manifest_block);
+        offset += manifest_block.len();
+    }
+    if let Some(logical_block) = logical_block {
+        bytes[offset..offset + logical_block.len()].copy_from_slice(&logical_block);
+        offset += logical_block.len();
+    }
+    bytes[offset..offset + KJM_FOOTER_BYTES].copy_from_slice(&footer);
+    Ok(bytes)
+}
+
+fn build_metadata_checkpoint_header(
+    page_size_bytes: u32,
+    checkpoint: &ReplaySeed,
+    manifest_entry_count: u32,
+    logical_shard_count: u32,
+    block_count: u64,
+    entry_count: u64,
+    physical_bytes_total: u64,
+) -> [u8; KJM_METADATA_HEADER_BYTES] {
+    let mut bytes = [0_u8; KJM_METADATA_HEADER_BYTES];
+    bytes[0..8].copy_from_slice(KJM_HEADER_MAGIC);
+    bytes[8..10].copy_from_slice(&FORMAT_MAJOR.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(KJM_METADATA_HEADER_BYTES as u32).to_le_bytes());
+    bytes[16..18].copy_from_slice(&FILE_KIND_METADATA_CHECKPOINT.to_le_bytes());
+    bytes[20..24].copy_from_slice(&page_size_bytes.to_le_bytes());
+    bytes[24..32].copy_from_slice(&NONE_U64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&block_count.to_le_bytes());
+    bytes[40..48].copy_from_slice(&entry_count.to_le_bytes());
+    bytes[48..56].copy_from_slice(&checkpoint.checkpoint_max_seqno.to_le_bytes());
+    bytes[56..64].copy_from_slice(&checkpoint.checkpoint_max_seqno.to_le_bytes());
+    bytes[64..72].copy_from_slice(&checkpoint.checkpoint_generation.to_le_bytes());
+    bytes[80..88].copy_from_slice(&physical_bytes_total.to_le_bytes());
+    bytes[128..136].copy_from_slice(&checkpoint.checkpoint_max_seqno.to_le_bytes());
+    bytes[136..144].copy_from_slice(&checkpoint.next_seqno.to_le_bytes());
+    bytes[144..152].copy_from_slice(&checkpoint.next_file_id.to_le_bytes());
+    bytes[152..156].copy_from_slice(&manifest_entry_count.to_le_bytes());
+    bytes[156..160].copy_from_slice(&logical_shard_count.to_le_bytes());
+    bytes[160..168].copy_from_slice(&checkpoint.checkpoint_data_generation.to_le_bytes());
+    let crc = crc32c(&zeroed_crc_field(&bytes, 88..92));
+    bytes[88..92].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+fn build_metadata_checkpoint_footer(
+    checkpoint: &ReplaySeed,
+    block_count: u64,
+    entry_count: u64,
+    physical_bytes_total: u64,
+) -> [u8; KJM_FOOTER_BYTES] {
+    let mut bytes = [0_u8; KJM_FOOTER_BYTES];
+    bytes[0..8].copy_from_slice(KJM_FOOTER_MAGIC);
+    bytes[8..10].copy_from_slice(&FORMAT_MAJOR.to_le_bytes());
+    bytes[12..16].copy_from_slice(&(KJM_FOOTER_BYTES as u32).to_le_bytes());
+    bytes[16..24].copy_from_slice(&NONE_U64.to_le_bytes());
+    bytes[24..32].copy_from_slice(&block_count.to_le_bytes());
+    bytes[32..40].copy_from_slice(&entry_count.to_le_bytes());
+    bytes[40..48].copy_from_slice(&checkpoint.checkpoint_max_seqno.to_le_bytes());
+    bytes[48..56].copy_from_slice(&checkpoint.checkpoint_max_seqno.to_le_bytes());
+    bytes[56..64].copy_from_slice(&checkpoint.checkpoint_generation.to_le_bytes());
+    bytes[72..80].copy_from_slice(&physical_bytes_total.to_le_bytes());
+    let crc = crc32c(&zeroed_crc_field(&bytes, 80..84));
+    bytes[80..84].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+fn build_metadata_block(
+    page_size_bytes: usize,
+    block_kind: u8,
+    values: &[Vec<u8>],
+    next_block_id_or_none: u64,
+) -> Result<Vec<u8>, Error> {
+    let slot_bytes = METADATA_BLOCK_FIXED_BYTES + (METADATA_BLOCK_SLOT_BYTES * values.len());
+    let variable_bytes_total = values.iter().map(Vec::len).sum::<usize>();
+    let block_bytes = align_up(slot_bytes + variable_bytes_total, page_size_bytes);
+    let block_span_pages = u32::try_from(block_bytes / page_size_bytes).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "metadata block exceeded the u32 page-span limit",
+        ))
+    })?;
+    let mut bytes = vec![0_u8; block_bytes];
+
+    let mut variable_offset = block_bytes;
+    let mut slots = vec![(0_u32, 0_u32); values.len()];
+    for (index, value) in values.iter().enumerate().rev() {
+        variable_offset = variable_offset.saturating_sub(value.len());
+        bytes[variable_offset..variable_offset + value.len()].copy_from_slice(value);
+        slots[index] = (variable_offset as u32, value.len() as u32);
+    }
+    if variable_offset < slot_bytes || variable_offset > u16::MAX as usize {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "metadata block layout exceeded the supported limits",
+        )));
+    }
+
+    bytes[0] = block_kind;
+    bytes[4..8].copy_from_slice(&(values.len() as u32).to_le_bytes());
+    bytes[8..12].copy_from_slice(&block_span_pages.to_le_bytes());
+    bytes[16..18].copy_from_slice(&(variable_offset as u16).to_le_bytes());
+    bytes[20..24].copy_from_slice(&((block_bytes - variable_offset) as u32).to_le_bytes());
+    bytes[24..32].copy_from_slice(&next_block_id_or_none.to_le_bytes());
+
+    let mut slot_offset = METADATA_BLOCK_FIXED_BYTES;
+    for slot in slots {
+        bytes[slot_offset..slot_offset + 4].copy_from_slice(&slot.0.to_le_bytes());
+        bytes[slot_offset + 4..slot_offset + 8].copy_from_slice(&slot.1.to_le_bytes());
+        slot_offset += METADATA_BLOCK_SLOT_BYTES;
+    }
+    let crc = crc32c(&zeroed_crc_field(&bytes, 32..36));
+    bytes[32..36].copy_from_slice(&crc.to_le_bytes());
+    Ok(bytes)
 }
 
 fn build_data_leaf_block(
@@ -1570,6 +2203,287 @@ fn read_data_file(path: &Path) -> Result<DecodedDataFile, Error> {
     Ok(DecodedDataFile { summary, records })
 }
 
+// The checkpoint reader validates header/footer totals, block ordering, and
+// every embedded wire value before the engine trusts the file during `open()`.
+fn read_metadata_checkpoint_file(
+    path: &Path,
+    expected_checkpoint_generation: u64,
+) -> Result<DecodedMetadataCheckpoint, Error> {
+    let bytes = fs::read(path).map_err(Error::Io)?;
+    if bytes.len() < KJM_METADATA_HEADER_BYTES + KJM_FOOTER_BYTES {
+        return Err(Error::Corruption(format!(
+            "metadata checkpoint `{}` was too short",
+            path.display()
+        )));
+    }
+
+    let header = &bytes[..KJM_METADATA_HEADER_BYTES];
+    let footer = &bytes[bytes.len() - KJM_FOOTER_BYTES..];
+    if &header[0..8] != KJM_HEADER_MAGIC || &footer[0..8] != KJM_FOOTER_MAGIC {
+        return Err(Error::Corruption(
+            "metadata checkpoint header or footer magic was invalid".into(),
+        ));
+    }
+    if read_u16(header, 8) != FORMAT_MAJOR || read_u16(footer, 8) != FORMAT_MAJOR {
+        return Err(Error::Corruption(
+            "metadata checkpoint format_major was invalid".into(),
+        ));
+    }
+    if read_u32(header, 12) != KJM_METADATA_HEADER_BYTES as u32
+        || read_u32(footer, 12) != KJM_FOOTER_BYTES as u32
+    {
+        return Err(Error::Corruption(
+            "metadata checkpoint header or footer byte count was invalid".into(),
+        ));
+    }
+    if read_u16(header, 16) != FILE_KIND_METADATA_CHECKPOINT {
+        return Err(Error::Corruption(
+            "metadata checkpoint file_kind was invalid".into(),
+        ));
+    }
+    if read_u16(header, 10) != 0
+        || read_u16(header, 18) != 0
+        || !header[92..128].iter().all(|byte| *byte == 0)
+        || !header[168..192].iter().all(|byte| *byte == 0)
+        || read_u16(footer, 10) != 0
+        || !footer[84..128].iter().all(|byte| *byte == 0)
+    {
+        return Err(Error::Corruption(
+            "metadata checkpoint reserved bytes must be zero".into(),
+        ));
+    }
+
+    let expected_header_crc = crc32c(&zeroed_crc_field(header, 88..92));
+    if expected_header_crc != read_u32(header, 88) {
+        return Err(Error::Checksum(
+            "metadata checkpoint header CRC32C did not match".into(),
+        ));
+    }
+    let expected_footer_crc = crc32c(&zeroed_crc_field(footer, 80..84));
+    if expected_footer_crc != read_u32(footer, 80) {
+        return Err(Error::Checksum(
+            "metadata checkpoint footer CRC32C did not match".into(),
+        ));
+    }
+
+    let page_size_bytes = read_u32(header, 20) as usize;
+    if !page_size_bytes.is_power_of_two() || !(4096..=32768).contains(&page_size_bytes) {
+        return Err(Error::Corruption(
+            "metadata checkpoint page_size_bytes was invalid".into(),
+        ));
+    }
+    if read_u64(header, 24) != NONE_U64 || read_u64(footer, 16) != NONE_U64 {
+        return Err(Error::Corruption(
+            "metadata checkpoint root_block_id_or_none must be NONE".into(),
+        ));
+    }
+    if read_u64(header, 72) != 0 || read_u64(footer, 64) != 0 {
+        return Err(Error::Corruption(
+            "metadata checkpoint logical_bytes_total must be zero".into(),
+        ));
+    }
+
+    let checkpoint_generation = read_u64(header, 64);
+    if checkpoint_generation != expected_checkpoint_generation
+        || read_u64(footer, 56) != expected_checkpoint_generation
+    {
+        return Err(Error::Corruption(
+            "metadata checkpoint generation did not match the expected file name".into(),
+        ));
+    }
+    let checkpoint_max_seqno = read_u64(header, 128);
+    if read_u64(header, 48) != checkpoint_max_seqno
+        || read_u64(header, 56) != checkpoint_max_seqno
+        || read_u64(footer, 40) != checkpoint_max_seqno
+        || read_u64(footer, 48) != checkpoint_max_seqno
+    {
+        return Err(Error::Corruption(
+            "metadata checkpoint seqno totals did not match checkpoint_max_seqno".into(),
+        ));
+    }
+
+    let physical_bytes_total = read_u64(header, 80);
+    if physical_bytes_total != bytes.len() as u64 || read_u64(footer, 72) != physical_bytes_total {
+        return Err(Error::Corruption(
+            "metadata checkpoint physical_bytes_total did not match the file length".into(),
+        ));
+    }
+
+    let manifest_entry_count = read_u32(header, 152) as usize;
+    let logical_shard_count = read_u32(header, 156) as usize;
+    let total_entry_count = manifest_entry_count + logical_shard_count;
+    if read_u64(header, 40) != total_entry_count as u64
+        || read_u64(footer, 32) != total_entry_count as u64
+    {
+        return Err(Error::Corruption(
+            "metadata checkpoint entry_count totals were invalid".into(),
+        ));
+    }
+
+    let block_count = read_u64(header, 32);
+    if read_u64(footer, 24) != block_count {
+        return Err(Error::Corruption(
+            "metadata checkpoint block_count totals were inconsistent".into(),
+        ));
+    }
+
+    let footer_offset = bytes.len() - KJM_FOOTER_BYTES;
+    let mut offset = page_size_bytes;
+    let mut manifest_entries = Vec::with_capacity(manifest_entry_count);
+    let mut logical_shards = Vec::with_capacity(logical_shard_count);
+    let mut seen_logical_block = false;
+
+    for _block_id in 1..=block_count {
+        if offset + METADATA_BLOCK_FIXED_BYTES > footer_offset {
+            return Err(Error::Corruption(
+                "metadata checkpoint block layout was truncated".into(),
+            ));
+        }
+        let block_span_pages = read_u32(&bytes, offset + 8) as usize;
+        if block_span_pages == 0 {
+            return Err(Error::Corruption(
+                "metadata checkpoint block_span_pages was invalid".into(),
+            ));
+        }
+        let block_bytes = block_span_pages * page_size_bytes;
+        if offset + block_bytes > footer_offset {
+            return Err(Error::Corruption(
+                "metadata checkpoint block layout crossed the footer boundary".into(),
+            ));
+        }
+
+        let block = &bytes[offset..offset + block_bytes];
+        let block_kind = block[0];
+        match block_kind {
+            BLOCK_KIND_FILE_MANIFEST if seen_logical_block => {
+                return Err(Error::Corruption(
+                    "metadata checkpoint manifest blocks must come before logical-shard blocks"
+                        .into(),
+                ));
+            }
+            BLOCK_KIND_FILE_MANIFEST | BLOCK_KIND_LOGICAL_SHARD => {}
+            other => {
+                return Err(Error::Corruption(format!(
+                    "metadata checkpoint block_kind {other} was invalid"
+                )));
+            }
+        }
+
+        let expected_block_crc = crc32c(&zeroed_crc_field(block, 32..36));
+        if expected_block_crc != read_u32(block, 32) {
+            return Err(Error::Checksum(
+                "metadata checkpoint block CRC32C did not match".into(),
+            ));
+        }
+        if block[1..4].iter().any(|byte| *byte != 0)
+            || read_u32(block, 12) != 0
+            || read_u16(block, 18) != 0
+            || !block[36..64].iter().all(|byte| *byte == 0)
+        {
+            return Err(Error::Corruption(
+                "metadata checkpoint block reserved bytes must be zero".into(),
+            ));
+        }
+
+        let entry_count = read_u32(block, 4) as usize;
+        let variable_begin = read_u16(block, 16) as usize;
+        let variable_total = read_u32(block, 20) as usize;
+        let slot_end = METADATA_BLOCK_FIXED_BYTES + (METADATA_BLOCK_SLOT_BYTES * entry_count);
+        if variable_begin < slot_end || variable_begin + variable_total > block.len() {
+            return Err(Error::Corruption(
+                "metadata checkpoint block variable bytes were invalid".into(),
+            ));
+        }
+
+        for index in 0..entry_count {
+            let slot_offset = METADATA_BLOCK_FIXED_BYTES + (index * METADATA_BLOCK_SLOT_BYTES);
+            let value_offset = read_u32(block, slot_offset) as usize;
+            let value_length = read_u32(block, slot_offset + 4) as usize;
+            if value_offset < variable_begin || value_offset + value_length > block.len() {
+                return Err(Error::Corruption(
+                    "metadata checkpoint slot bounds were invalid".into(),
+                ));
+            }
+
+            match block_kind {
+                BLOCK_KIND_FILE_MANIFEST => {
+                    let (file_meta, next_offset) = decode_file_meta_wire(block, value_offset)?;
+                    if next_offset != value_offset + value_length {
+                        return Err(Error::Corruption(
+                            "metadata checkpoint FileMetaWire length did not match its slot".into(),
+                        ));
+                    }
+                    manifest_entries.push(file_meta);
+                }
+                BLOCK_KIND_LOGICAL_SHARD => {
+                    let (entry, next_offset) =
+                        decode_logical_shard_entry_wire(block, value_offset)?;
+                    if next_offset != value_offset + value_length {
+                        return Err(Error::Corruption(
+                            "metadata checkpoint LogicalShardEntryWire length did not match its slot"
+                                .into(),
+                        ));
+                    }
+                    logical_shards.push(entry);
+                }
+                _ => unreachable!("metadata checkpoint block kind validated above"),
+            }
+        }
+
+        if block_kind == BLOCK_KIND_LOGICAL_SHARD {
+            seen_logical_block = true;
+        }
+        offset += block_bytes;
+    }
+
+    if offset != footer_offset {
+        return Err(Error::Corruption(
+            "metadata checkpoint block layout did not reach the footer boundary".into(),
+        ));
+    }
+    if manifest_entries.len() != manifest_entry_count || logical_shards.len() != logical_shard_count
+    {
+        return Err(Error::Corruption(
+            "metadata checkpoint entry counts did not match the header extension".into(),
+        ));
+    }
+    if !manifest_entries.windows(2).all(|window| {
+        window[0].level_no < window[1].level_no
+            || (window[0].level_no == window[1].level_no && window[0].file_id < window[1].file_id)
+    }) {
+        return Err(Error::Corruption(
+            "metadata checkpoint FileManifestBlock values were not sorted by (level_no, file_id)"
+                .into(),
+        ));
+    }
+    validate_logical_shard_entries(&logical_shards, "metadata checkpoint logical shards")?;
+
+    let mut levels = Vec::<ManifestLevelView>::new();
+    for file_meta in manifest_entries {
+        let level = ensure_level(&mut levels, file_meta.level_no);
+        level.files.push(file_meta);
+    }
+    for level in &mut levels {
+        if level.level_no == 0 {
+            level.files.sort_by_key(|file| file.file_id);
+        } else {
+            level
+                .files
+                .sort_by(|left, right| left.min_user_key.cmp(&right.min_user_key));
+        }
+    }
+
+    Ok(DecodedMetadataCheckpoint {
+        checkpoint_generation,
+        checkpoint_max_seqno,
+        checkpoint_data_generation: read_u64(header, 160),
+        next_seqno: read_u64(header, 136),
+        next_file_id: read_u64(header, 144),
+        levels,
+        logical_shards,
+    })
+}
+
 fn validate_output_file_metas(
     layout: &StoreLayout,
     output_file_metas: &[FileMeta],
@@ -1698,12 +2612,113 @@ fn ensure_level(levels: &mut Vec<ManifestLevelView>, level_no: u16) -> &mut Mani
     &mut levels[index]
 }
 
+// Replay and checkpoint validation both need a stable set of already-consumed
+// file ids so later publishes cannot silently reuse one durable file id.
+fn collect_used_file_ids(levels: &[ManifestLevelView]) -> BTreeSet<u64> {
+    levels
+        .iter()
+        .flat_map(|level| level.files.iter().map(|file| file.file_id))
+        .collect()
+}
+
+fn validate_logical_shard_entry(entry: &LogicalShardEntry) -> Result<(), Error> {
+    if matches!(entry.start_bound, Bound::PosInf) || matches!(entry.end_bound, Bound::NegInf) {
+        return Err(Error::Corruption(
+            "LogicalShardEntryWire bounds must use NegInf/Finite for start and Finite/PosInf for end"
+                .into(),
+        ));
+    }
+    if compare_bound(&entry.start_bound, &entry.end_bound) >= 0 {
+        return Err(Error::Corruption(
+            "LogicalShardEntryWire range must be non-empty".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_logical_shard_entries(
+    entries: &[LogicalShardEntry],
+    subject: &str,
+) -> Result<(), Error> {
+    for entry in entries {
+        validate_logical_shard_entry(entry)?;
+    }
+    for pair in entries.windows(2) {
+        if pair[0].end_bound != pair[1].start_bound {
+            return Err(Error::Corruption(format!(
+                "{subject} must remain disjoint, contiguous, and sorted"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_logical_shard_install_entries(
+    source_entries: &[LogicalShardEntry],
+    output_entries: &[LogicalShardEntry],
+) -> Result<(), Error> {
+    if !(1..=2).contains(&source_entries.len()) || !(1..=2).contains(&output_entries.len()) {
+        return Err(Error::Corruption(
+            "LogicalShardInstall entry counts must be 1 or 2".into(),
+        ));
+    }
+    validate_logical_shard_entries(source_entries, "LogicalShardInstall source entries")?;
+    validate_logical_shard_entries(output_entries, "LogicalShardInstall output entries")?;
+    if source_entries == output_entries {
+        return Err(Error::Corruption(
+            "LogicalShardInstall must not encode a no-op update".into(),
+        ));
+    }
+    if source_entries.first().map(|entry| &entry.start_bound)
+        != output_entries.first().map(|entry| &entry.start_bound)
+        || source_entries.last().map(|entry| &entry.end_bound)
+            != output_entries.last().map(|entry| &entry.end_bound)
+    {
+        return Err(Error::Corruption(
+            "LogicalShardInstall must preserve the same outer bounds".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn apply_replay_logical_install(
+    current_logical_shards: &mut Vec<LogicalShardEntry>,
+    payload: &LogicalShardInstallPayload,
+) -> Result<(), Error> {
+    let Some(index) = current_logical_shards
+        .windows(payload.source_entries.len())
+        .position(|window| window == payload.source_entries)
+    else {
+        return Err(Error::Corruption(
+            "LogicalShardInstall source entries did not match the replay-state logical shard map"
+                .into(),
+        ));
+    };
+    current_logical_shards.splice(
+        index..index + payload.source_entries.len(),
+        payload.output_entries.clone(),
+    );
+    Ok(())
+}
+
 fn max_output_file_id(output_file_metas: &[FileMeta]) -> u64 {
     output_file_metas
         .iter()
         .map(|file| file.file_id)
         .max()
         .unwrap_or(0)
+}
+
+// Replay starts at the first segment that can still cover the checkpoint
+// frontier; older fully covered segments are skipped entirely.
+fn wal_segment_may_contain_seqno(name: &WalFileName, replay_start_seqno: u64) -> bool {
+    if name.first_seqno == NONE_U64 {
+        return true;
+    }
+    match name.last_seqno {
+        Some(last_seqno) => last_seqno >= replay_start_seqno,
+        None => name.first_seqno <= replay_start_seqno,
+    }
 }
 
 fn format_active_segment_name(first_seqno: u64) -> String {
@@ -1748,6 +2763,15 @@ fn parse_wal_file_name(file_name: &str) -> Option<WalFileName> {
     })
 }
 
+fn parse_data_file_name(file_name: &str) -> Option<u64> {
+    let suffix = ".kjm";
+    let body = file_name.strip_suffix(suffix)?;
+    if body.len() != 20 || body.starts_with('.') {
+        return None;
+    }
+    body.parse().ok()
+}
+
 fn sync_directory(path: &Path) -> Result<(), Error> {
     File::open(path)
         .map_err(Error::Io)?
@@ -1785,6 +2809,29 @@ fn is_strictly_sorted_unique(values: &[u64]) -> bool {
     values.windows(2).all(|window| window[0] < window[1])
 }
 
+fn compare_bound(left: &Bound, right: &Bound) -> i8 {
+    match (left, right) {
+        (Bound::NegInf, Bound::NegInf) | (Bound::PosInf, Bound::PosInf) => 0,
+        (Bound::NegInf, _) | (_, Bound::PosInf) => -1,
+        (Bound::PosInf, _) | (_, Bound::NegInf) => 1,
+        (Bound::Finite(left), Bound::Finite(right)) => match left.cmp(right) {
+            std::cmp::Ordering::Less => -1,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        },
+    }
+}
+
+// Fresh stores and WAL-only recovery both start from one current full-keyspace
+// logical shard until a durable checkpoint or logical install says otherwise.
+fn full_keyspace_logical_shard() -> LogicalShardEntry {
+    LogicalShardEntry {
+        start_bound: Bound::NegInf,
+        end_bound: Bound::PosInf,
+        live_size_bytes: 0,
+    }
+}
+
 struct ParsedHeader {
     first_seqno: u64,
 }
@@ -1815,13 +2862,17 @@ mod tests {
 
     use crate::idam::StoreLayout;
     use crate::nilaimai::{
-        CompactPublishPayload, FileMeta, FlushPublishPayload, InternalRecord, Mutation, RecordKind,
+        CompactPublishPayload, FileMeta, FlushPublishPayload, InternalRecord, LogicalShardEntry,
+        ManifestLevelView, Mutation, RecordKind,
     };
+    use crate::sevai::Bound;
 
     use super::{
-        AppendOutcome, CurrentFile, SyncMode, WalWriter, WalWriterTestOptions, build_current_bytes,
-        build_segment_header, build_temp_data_file, crc32c, encode_wal_record,
-        format_active_segment_name, parse_wal_file_name, read_current, recover_wal,
+        AppendOutcome, CurrentFile, ReplaySeed, SyncMode, WalWriter, WalWriterTestOptions,
+        build_current_bytes, build_segment_header, build_temp_data_file,
+        build_temp_metadata_checkpoint_file, crc32c, encode_wal_record, format_active_segment_name,
+        install_metadata_checkpoint, parse_wal_file_name, read_current, read_metadata_checkpoint,
+        recover_wal, truncate_covered_closed_wal_segments,
     };
 
     static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
@@ -1852,6 +2903,53 @@ mod tests {
         fs::write(layout.current_path(), corrupt).unwrap();
         let error = read_current(&layout).unwrap_err();
         assert!(error.to_string().contains("CURRENT body CRC32C"));
+    }
+
+    #[test]
+    fn metadata_checkpoints_round_trip_and_validate_manifest_files() {
+        let layout = test_layout();
+        fs::create_dir_all(layout.meta_dir()).unwrap();
+        fs::create_dir_all(layout.data_dir()).unwrap();
+
+        let temp_path = layout.temp_data_file_path("checkpoint");
+        let summary = build_temp_data_file(
+            &temp_path,
+            4096,
+            &[InternalRecord {
+                user_key: b"ant".to_vec(),
+                seqno: 5,
+                kind: RecordKind::Put,
+                value: Some(b"a".to_vec()),
+            }],
+        )
+        .unwrap();
+        fs::rename(&temp_path, layout.data_file_path(1)).unwrap();
+
+        let checkpoint = ReplaySeed {
+            checkpoint_generation: 1,
+            checkpoint_max_seqno: 5,
+            checkpoint_data_generation: 2,
+            next_seqno: 6,
+            next_file_id: 2,
+            levels: vec![ManifestLevelView {
+                level_no: 0,
+                files: vec![summary.to_file_meta(1, 0)],
+            }],
+            logical_shards: vec![LogicalShardEntry::new(Bound::NegInf, Bound::PosInf, 4).unwrap()],
+        };
+        let temp_checkpoint =
+            build_temp_metadata_checkpoint_file(&layout, 4096, &checkpoint, "round-trip").unwrap();
+        install_metadata_checkpoint(&layout, &temp_checkpoint, 1).unwrap();
+
+        let decoded = read_metadata_checkpoint(&layout, 1).unwrap();
+        assert_eq!(decoded.checkpoint_generation, 1);
+        assert_eq!(decoded.checkpoint_max_seqno, 5);
+        assert_eq!(decoded.checkpoint_data_generation, 2);
+        assert_eq!(decoded.next_seqno, 6);
+        assert_eq!(decoded.next_file_id, 2);
+        assert_eq!(decoded.levels.len(), 1);
+        assert_eq!(decoded.levels[0].files[0].file_id, 1);
+        assert_eq!(decoded.logical_shards, checkpoint.logical_shards);
     }
 
     #[test]
@@ -2009,11 +3107,108 @@ mod tests {
         );
         fs::write(path, bytes).unwrap();
 
-        let recovered = recover_wal(&layout, 1_073_741_824).unwrap();
+        let recovered = recover_wal(&layout, 1_073_741_824, None).unwrap();
         assert_eq!(recovered.last_committed_seqno, 2);
         assert_eq!(recovered.pending_mutations.len(), 0);
         assert_eq!(recovered.data_generation, 1);
         assert_eq!(recovered.levels[0].files.len(), 1);
+    }
+
+    #[test]
+    fn replay_seed_starts_recovery_after_the_checkpoint_frontier() {
+        let layout = test_layout();
+        fs::create_dir_all(layout.wal_dir()).unwrap();
+        let path = layout.wal_dir().join(format_active_segment_name(1));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&build_segment_header(1, 1_073_741_824));
+        bytes.extend_from_slice(
+            &encode_wal_record(
+                1,
+                &super::WalRecordBody::Mutation(Mutation::Put {
+                    key: b"old".to_vec(),
+                    value: b"v1".to_vec(),
+                }),
+            )
+            .unwrap(),
+        );
+        bytes.extend_from_slice(
+            &encode_wal_record(
+                2,
+                &super::WalRecordBody::Mutation(Mutation::Put {
+                    key: b"new".to_vec(),
+                    value: b"v2".to_vec(),
+                }),
+            )
+            .unwrap(),
+        );
+        fs::write(path, bytes).unwrap();
+
+        let replay_seed = ReplaySeed {
+            checkpoint_generation: 1,
+            checkpoint_max_seqno: 1,
+            checkpoint_data_generation: 0,
+            next_seqno: 2,
+            next_file_id: 1,
+            levels: Vec::new(),
+            logical_shards: vec![LogicalShardEntry::new(Bound::NegInf, Bound::PosInf, 0).unwrap()],
+        };
+        let recovered = recover_wal(&layout, 1_073_741_824, Some(&replay_seed)).unwrap();
+        assert_eq!(recovered.last_committed_seqno, 2);
+        assert_eq!(recovered.pending_mutations.len(), 1);
+        assert_eq!(recovered.pending_mutations[0].seqno, 2);
+        assert_eq!(
+            recovered.pending_mutations[0].mutation,
+            Mutation::Put {
+                key: b"new".to_vec(),
+                value: b"v2".to_vec(),
+            }
+        );
+    }
+
+    #[test]
+    fn wal_truncation_keeps_only_segments_past_the_checkpoint_frontier() {
+        let layout = test_layout();
+        fs::create_dir_all(layout.wal_dir()).unwrap();
+        fs::write(
+            layout
+                .wal_dir()
+                .join("wal-00000000000000000001-00000000000000000002.log"),
+            b"a",
+        )
+        .unwrap();
+        fs::write(
+            layout
+                .wal_dir()
+                .join("wal-00000000000000000003-00000000000000000005.log"),
+            b"b",
+        )
+        .unwrap();
+        fs::write(
+            layout.wal_dir().join("wal-00000000000000000006-open.log"),
+            b"c",
+        )
+        .unwrap();
+
+        truncate_covered_closed_wal_segments(&layout, 2).unwrap();
+
+        assert!(
+            !layout
+                .wal_dir()
+                .join("wal-00000000000000000001-00000000000000000002.log")
+                .exists()
+        );
+        assert!(
+            layout
+                .wal_dir()
+                .join("wal-00000000000000000003-00000000000000000005.log")
+                .exists()
+        );
+        assert!(
+            layout
+                .wal_dir()
+                .join("wal-00000000000000000006-open.log")
+                .exists()
+        );
     }
 
     #[test]
@@ -2046,7 +3241,7 @@ mod tests {
         assert_eq!(writer.sync_to_current_frontier(1).unwrap(), 1);
         writer.shutdown();
 
-        let recovered = recover_wal(&layout, 1_073_741_824).unwrap();
+        let recovered = recover_wal(&layout, 1_073_741_824, None).unwrap();
         assert_eq!(recovered.last_committed_seqno, 1);
         assert_eq!(recovered.pending_mutations.len(), 1);
     }

@@ -1,11 +1,11 @@
 //! Public engine shell and shared operation foundations for the `Pezhai` storage engine.
 
-use std::collections::HashMap;
 use std::fs::{self, File};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
 use tokio::task;
@@ -14,14 +14,19 @@ use crate::config::load_runtime_config;
 use crate::error::Error;
 use crate::idam::StoreLayout;
 use crate::nilaimai::{
-    CompactPublishPayload, EngineState, FlushPublishPayload, Memtable, MemtableRef, Mutation,
+    CompactPublishPayload, DurableCurrent, EngineState, FlushPublishPayload,
+    LogicalShardInstallPayload, Memtable, MemtableRef, Mutation,
 };
 use crate::pani::{
-    build_compaction_output, build_flush_output, execute_point_read, execute_scan_plan,
+    build_compaction_output, build_flush_output, execute_gc, execute_logical_maintenance_plan,
+    execute_point_read, execute_scan_plan,
 };
 use crate::pathivu::{
-    MAX_KEY_BYTES, MAX_VALUE_BYTES, WalRecovery, WalWriter, WalWriterTestOptions, read_current,
-    recover_wal,
+    CurrentFile, MAX_KEY_BYTES, MAX_VALUE_BYTES, ReplaySeed, WalRecovery, WalWriter,
+    WalWriterTestOptions, build_temp_metadata_checkpoint_file, install_current,
+    install_metadata_checkpoint, list_canonical_data_file_ids, read_current,
+    read_metadata_checkpoint, recover_wal, retained_wal_bytes_after,
+    truncate_covered_closed_wal_segments,
 };
 
 use crate::sevai::{Bound, GetResponse, ScanRow, StatsResponse};
@@ -418,25 +423,34 @@ impl PezhaiEngine {
         fs::create_dir_all(layout.meta_dir()).map_err(Error::Io)?;
         fs::create_dir_all(layout.data_dir()).map_err(Error::Io)?;
 
-        if let Some(current) = read_current(&layout)?
-            && (current.checkpoint_generation != 0
-                || current.checkpoint_max_seqno != 0
-                || current.checkpoint_data_generation != 0)
-        {
-            return Err(Error::Corruption(
-                "CURRENT references metadata checkpoints that are not supported until milestone 4"
-                    .into(),
-            ));
-        }
+        let checkpoint_seed = match read_current(&layout)? {
+            Some(current)
+                if current.checkpoint_generation != 0
+                    || current.checkpoint_max_seqno != 0
+                    || current.checkpoint_data_generation != 0 =>
+            {
+                let checkpoint = read_metadata_checkpoint(&layout, current.checkpoint_generation)?;
+                if checkpoint.checkpoint_max_seqno != current.checkpoint_max_seqno
+                    || checkpoint.checkpoint_data_generation != current.checkpoint_data_generation
+                {
+                    return Err(Error::Corruption(
+                        "CURRENT did not match the referenced metadata checkpoint".into(),
+                    ));
+                }
+                Some(checkpoint)
+            }
+            _ => None,
+        };
 
         let WalRecovery {
             pending_mutations,
             levels,
+            logical_shards,
             last_committed_seqno,
             data_generation,
             next_file_id,
             active_segment,
-        } = recover_wal(&layout, config.wal.segment_bytes)?;
+        } = recover_wal(&layout, config.wal.segment_bytes, checkpoint_seed.as_ref())?;
         let engine_instance_id = NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
         let active_memtable: MemtableRef = Arc::new(Mutex::new(Memtable::default()));
         for recovered in &pending_mutations {
@@ -446,7 +460,7 @@ impl PezhaiEngine {
                 &recovered.mutation,
             )?;
         }
-        let mut state = EngineState::from_recovery(
+        let state = EngineState::from_recovery(
             config.clone(),
             engine_instance_id,
             data_generation,
@@ -454,9 +468,12 @@ impl PezhaiEngine {
             last_committed_seqno,
             active_memtable,
             levels,
+            logical_shards,
+            checkpoint_seed.as_ref().map(durable_current_from_seed),
+            checkpoint_seed
+                .as_ref()
+                .map_or(1, |seed| seed.checkpoint_generation.saturating_add(1)),
         );
-        let visible_cache = rebuild_visible_bytes_cache(&layout, &state)?;
-        state.install_visible_bytes_cache(visible_cache);
 
         let writer = WalWriter::open(
             layout.clone(),
@@ -616,7 +633,14 @@ fn wal_worker_loop(
 
 fn run_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
     loop {
-        let (page_size_bytes, flush_plan, compaction_plan) = match core.lock_state() {
+        let (
+            page_size_bytes,
+            flush_plan,
+            compaction_plan,
+            logical_plan,
+            checkpoint_frontier,
+            gc_protected_ids,
+        ) = match core.lock_state() {
             Ok(state) => {
                 let flush_plan = state.plan_flush();
                 let compaction_plan = if flush_plan.is_none() {
@@ -624,7 +648,29 @@ fn run_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
                 } else {
                     None
                 };
-                (state.page_size_bytes(), flush_plan, compaction_plan)
+                let logical_plan = if flush_plan.is_none() {
+                    match state.plan_logical_maintenance() {
+                        Ok(plan) => Some(plan),
+                        Err(_) => return,
+                    }
+                } else {
+                    None
+                };
+                let gc_protected_ids = match state.gc_protected_file_ids() {
+                    Ok(ids) => ids,
+                    Err(_) => return,
+                };
+                (
+                    state.page_size_bytes(),
+                    flush_plan,
+                    compaction_plan,
+                    logical_plan,
+                    state
+                        .durable_current()
+                        .map(|current| current.checkpoint_max_seqno)
+                        .unwrap_or(0),
+                    gc_protected_ids,
+                )
             }
             Err(_) => return,
         };
@@ -635,11 +681,49 @@ fn run_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
             }
             continue;
         }
+
+        let retained_wal_bytes = match retained_wal_bytes_after(&core.layout, checkpoint_frontier) {
+            Ok(bytes) => bytes,
+            Err(_) => return,
+        };
+        let should_checkpoint = match core.lock_state() {
+            Ok(state) => state.should_checkpoint(retained_wal_bytes),
+            Err(_) => return,
+        };
+        if should_checkpoint {
+            if install_checkpoint(core, writer, page_size_bytes).is_err() {
+                return;
+            }
+            continue;
+        }
+
         if let Some(plan) = compaction_plan {
             if publish_compaction_plan(core, writer, plan, page_size_bytes).is_err() {
                 return;
             }
             continue;
+        }
+
+        if let Some(plan) = logical_plan {
+            let payload = match execute_logical_maintenance_plan(&core.layout, &plan) {
+                Ok(payload) => payload,
+                Err(_) => return,
+            };
+            if let Some(payload) = payload {
+                if publish_logical_install(core, writer, &payload).is_err() {
+                    return;
+                }
+                continue;
+            }
+        }
+
+        let mut gc_candidates = match list_canonical_data_file_ids(&core.layout) {
+            Ok(file_ids) => file_ids,
+            Err(_) => return,
+        };
+        gc_candidates.retain(|file_id| !gc_protected_ids.contains(file_id));
+        if !gc_candidates.is_empty() {
+            execute_gc(&core.layout, &gc_candidates);
         }
         return;
     }
@@ -717,22 +801,120 @@ fn publish_compaction_plan(
     }
 }
 
-fn rebuild_visible_bytes_cache(
-    layout: &StoreLayout,
-    state: &EngineState,
-) -> Result<HashMap<Vec<u8>, u64>, Error> {
-    let plan = state.plan_scan(
-        &Bound::NegInf,
-        &Bound::PosInf,
-        state.last_committed_seqno,
-        state.data_generation,
-    )?;
-    let rows = execute_scan_plan(layout, &plan)?;
-    let mut visible = HashMap::new();
-    for row in rows {
-        visible.insert(row.key.clone(), (row.key.len() + row.value.len()) as u64);
+// Logical installs are metadata-only publishes: the worker appends one WAL
+// record and swaps the current logical-shard map only after that record sticks.
+fn publish_logical_install(
+    core: &EngineCore,
+    writer: &mut WalWriter,
+    payload: &LogicalShardInstallPayload,
+) -> Result<(), Error> {
+    let mut state = core.lock_state()?;
+    state.validate_logical_install(payload)?;
+
+    let seqno = state.reserve_seqno()?;
+    let sync_mode = state.sync_mode();
+    match writer.append_logical_shard_install(seqno, payload, sync_mode) {
+        Ok(outcome) => state.apply_logical_install(seqno, outcome.durably_synced, payload),
+        Err(error) => {
+            state.mark_write_failed(error.to_string());
+            Err(error)
+        }
     }
-    Ok(visible)
+}
+
+// Checkpoint install drains mutable shared-data state, captures one exact
+// file-only manifest plus logical-shard map, then follows the durable
+// temp-file/rename/fsync order before trimming any covered closed WAL files.
+fn install_checkpoint(
+    core: &EngineCore,
+    writer: &mut WalWriter,
+    page_size_bytes: u32,
+) -> Result<(), Error> {
+    loop {
+        let flush_plan = {
+            let mut state = core.lock_state()?;
+            state.freeze_active_memtable_if_non_empty()?;
+            state.plan_flush()
+        };
+
+        if let Some(plan) = flush_plan {
+            publish_flush_plan(core, writer, plan, page_size_bytes)?;
+            continue;
+        }
+        break;
+    }
+
+    let checkpoint = {
+        let mut state = core.lock_state()?;
+        state.enter_checkpoint_capture_pause()?;
+        let captured = state.capture_metadata_checkpoint();
+        state.leave_checkpoint_capture_pause();
+        captured?
+    };
+
+    let replay_seed = ReplaySeed {
+        checkpoint_generation: checkpoint.checkpoint_generation,
+        checkpoint_max_seqno: checkpoint.checkpoint_max_seqno,
+        checkpoint_data_generation: checkpoint.checkpoint_data_generation,
+        next_seqno: checkpoint.next_seqno,
+        next_file_id: checkpoint.next_file_id,
+        levels: checkpoint.levels.clone(),
+        logical_shards: checkpoint.logical_shards.clone(),
+    };
+    let temp_tag = format!(
+        "checkpoint-{}-{}-{}",
+        replay_seed.checkpoint_generation,
+        replay_seed.checkpoint_max_seqno,
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let temp_path = build_temp_metadata_checkpoint_file(
+        &core.layout,
+        page_size_bytes,
+        &replay_seed,
+        &temp_tag,
+    )?;
+    let _canonical_path =
+        install_metadata_checkpoint(&core.layout, &temp_path, replay_seed.checkpoint_generation)?;
+    install_current(
+        &core.layout,
+        CurrentFile {
+            checkpoint_generation: replay_seed.checkpoint_generation,
+            checkpoint_max_seqno: replay_seed.checkpoint_max_seqno,
+            checkpoint_data_generation: replay_seed.checkpoint_data_generation,
+        },
+        &temp_tag,
+    )?;
+
+    {
+        let mut state = core.lock_state()?;
+        state.install_durable_current(
+            replay_seed.checkpoint_generation,
+            replay_seed.checkpoint_max_seqno,
+            replay_seed.checkpoint_data_generation,
+            &replay_seed.levels,
+        );
+    }
+
+    truncate_covered_closed_wal_segments(&core.layout, replay_seed.checkpoint_max_seqno)?;
+    Ok(())
+}
+
+// Reopen keeps the durable `CURRENT` frontier separate from the mutable live
+// manifest so GC can preserve checkpoint-pinned files after later publishes.
+fn durable_current_from_seed(seed: &ReplaySeed) -> DurableCurrent {
+    DurableCurrent {
+        checkpoint_generation: seed.checkpoint_generation,
+        checkpoint_max_seqno: seed.checkpoint_max_seqno,
+        checkpoint_data_generation: seed.checkpoint_data_generation,
+        file_ids: seed
+            .levels
+            .iter()
+            .flat_map(|level| level.files.iter().map(|file| file.file_id))
+            .collect(),
+    }
 }
 
 fn resolve_snapshot(
@@ -860,7 +1042,12 @@ mod tests {
     use super::{
         Bound, EngineTestOptions, MAX_KEY_BYTES, MAX_VALUE_BYTES, PezhaiEngine, ScanRange,
     };
-    use crate::pathivu::{CurrentFile, WalWriterTestOptions, build_current_bytes};
+    use crate::idam::StoreLayout;
+    use crate::nilaimai::LogicalShardEntry;
+    use crate::pathivu::{
+        CurrentFile, ReplaySeed, WalWriterTestOptions, build_current_bytes,
+        build_temp_metadata_checkpoint_file, install_metadata_checkpoint, read_current,
+    };
     use crate::sevai::{LogicalShardStats, ScanRow, StatsResponse};
 
     static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
@@ -911,6 +1098,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoints_install_current_and_restore_reopen_state() {
+        let config_path = write_test_config(
+            "per_write",
+            Some(
+                r#"
+[maintenance]
+checkpoint_after_wal_bytes = 1
+"#,
+            ),
+        );
+        let layout = StoreLayout::from_config_path(&config_path);
+        let engine = PezhaiEngine::open(&config_path).unwrap();
+
+        engine.put(b"ant", b"a").await.unwrap();
+
+        let current = read_current(&layout).unwrap().unwrap();
+        assert_eq!(current.checkpoint_generation, 1);
+        assert_eq!(current.checkpoint_max_seqno, 2);
+        assert_eq!(current.checkpoint_data_generation, 2);
+        assert!(layout.meta_file_path(1).exists());
+
+        engine.close().unwrap();
+
+        let reopened = PezhaiEngine::open(&config_path).unwrap();
+        let ant = reopened.get(b"ant", None).await.unwrap();
+        assert_eq!(ant.value, Some(b"a".to_vec()));
+        let stats = reopened.stats().await.unwrap();
+        assert_eq!(stats.observation_seqno, 2);
+        assert_eq!(stats.data_generation, 2);
+        reopened.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn orphan_metadata_checkpoints_are_ignored_without_current() {
+        let config_path = write_test_config("per_write", None);
+        let layout = StoreLayout::from_config_path(&config_path);
+        let orphan_checkpoint = ReplaySeed {
+            checkpoint_generation: 1,
+            checkpoint_max_seqno: 9,
+            checkpoint_data_generation: 0,
+            next_seqno: 10,
+            next_file_id: 1,
+            levels: Vec::new(),
+            logical_shards: vec![LogicalShardEntry::new(Bound::NegInf, Bound::PosInf, 99).unwrap()],
+        };
+        let temp_path =
+            build_temp_metadata_checkpoint_file(&layout, 4096, &orphan_checkpoint, "orphan")
+                .unwrap();
+        install_metadata_checkpoint(&layout, &temp_path, 1).unwrap();
+
+        let engine = PezhaiEngine::open(&config_path).unwrap();
+        let stats = engine.stats().await.unwrap();
+        assert_eq!(stats.observation_seqno, 0);
+        assert_eq!(stats.data_generation, 0);
+        assert_eq!(
+            stats.logical_shards,
+            vec![LogicalShardStats {
+                start_bound: Bound::NegInf,
+                end_bound: Bound::PosInf,
+                live_size_bytes: 0,
+            }]
+        );
+        engine.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn manual_mode_batches_durability_until_sync() {
         let config_path = write_test_config("manual", None);
         let engine = PezhaiEngine::open(&config_path).unwrap();
@@ -921,6 +1174,59 @@ mod tests {
 
         let sync = engine.sync().await.unwrap();
         assert_eq!(sync.durable_seqno, 1);
+        engine.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn logical_split_and_merge_update_stats_without_breaking_snapshots() {
+        let config_path = write_test_config(
+            "per_write",
+            Some(
+                r#"
+[maintenance]
+logical_split_bytes = 4
+logical_merge_bytes = 3
+checkpoint_after_wal_bytes = 1073741824
+"#,
+            ),
+        );
+        let engine = PezhaiEngine::open(&config_path).unwrap();
+
+        engine.put(b"ant", b"a").await.unwrap();
+        let split_stats = engine.stats().await.unwrap();
+        assert_eq!(split_stats.logical_shards.len(), 2);
+        assert_eq!(
+            split_stats.logical_shards[0],
+            LogicalShardStats {
+                start_bound: Bound::NegInf,
+                end_bound: Bound::Finite(b"ant".to_vec()),
+                live_size_bytes: 0,
+            }
+        );
+        assert_eq!(
+            split_stats.logical_shards[1],
+            LogicalShardStats {
+                start_bound: Bound::Finite(b"ant".to_vec()),
+                end_bound: Bound::PosInf,
+                live_size_bytes: 4,
+            }
+        );
+
+        let snapshot = engine.create_snapshot().await.unwrap();
+        engine.delete(b"ant").await.unwrap();
+
+        let merged_stats = engine.stats().await.unwrap();
+        assert_eq!(
+            merged_stats.logical_shards,
+            vec![LogicalShardStats {
+                start_bound: Bound::NegInf,
+                end_bound: Bound::PosInf,
+                live_size_bytes: 0,
+            }]
+        );
+        let snapshot_read = engine.get(b"ant", Some(&snapshot)).await.unwrap();
+        assert_eq!(snapshot_read.value, Some(b"a".to_vec()));
+        engine.release_snapshot(snapshot).await.unwrap();
         engine.close().unwrap();
     }
 
@@ -1150,7 +1456,7 @@ l0_file_threshold = 2
     }
 
     #[test]
-    fn open_rejects_current_pointers_to_future_checkpoint_milestones() {
+    fn open_requires_the_checkpoint_named_by_current() {
         let config_path = write_test_config("per_write", None);
         let current_path = config_path.parent().unwrap().join("CURRENT");
         fs::write(
@@ -1164,14 +1470,10 @@ l0_file_threshold = 2
         .unwrap();
 
         let error = match PezhaiEngine::open(&config_path) {
-            Ok(_) => panic!("CURRENT-backed opens should be rejected before checkpoint support"),
+            Ok(_) => panic!("CURRENT-backed opens should require the named checkpoint file"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .to_string()
-                .contains("CURRENT references metadata checkpoints")
-        );
+        assert!(matches!(error, crate::Error::Io(_)));
     }
 
     #[test]

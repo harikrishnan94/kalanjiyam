@@ -1,7 +1,7 @@
 //! Mutable engine state, manifest generations, and immutable read/maintenance plans.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -309,6 +309,73 @@ pub(crate) struct SnapshotEntry {
     pub(crate) data_generation: u64,
 }
 
+/// One current logical-shard entry used only for latest metadata and `stats()`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LogicalShardEntry {
+    pub(crate) start_bound: Bound,
+    pub(crate) end_bound: Bound,
+    pub(crate) live_size_bytes: u64,
+}
+
+impl LogicalShardEntry {
+    /// Builds one validated logical-shard entry.
+    pub(crate) fn new(
+        start_bound: Bound,
+        end_bound: Bound,
+        live_size_bytes: u64,
+    ) -> Result<Self, Error> {
+        validate_logical_shard_bounds(&start_bound, &end_bound)?;
+        Ok(Self {
+            start_bound,
+            end_bound,
+            live_size_bytes,
+        })
+    }
+
+    /// Returns `true` when the entry contains the requested user key.
+    #[must_use]
+    pub(crate) fn contains_key(&self, key: &[u8]) -> bool {
+        key_in_range(key, &self.start_bound, &self.end_bound)
+    }
+}
+
+/// One logical-shard map replacement that becomes visible only after WAL acceptance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LogicalShardInstallPayload {
+    pub(crate) source_entries: Vec<LogicalShardEntry>,
+    pub(crate) output_entries: Vec<LogicalShardEntry>,
+}
+
+/// The durable checkpoint frontier currently named by `CURRENT`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DurableCurrent {
+    pub(crate) checkpoint_generation: u64,
+    pub(crate) checkpoint_max_seqno: u64,
+    pub(crate) checkpoint_data_generation: u64,
+    pub(crate) file_ids: BTreeSet<u64>,
+}
+
+/// One captured metadata-checkpoint view prepared for the durable write path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MetadataCheckpointCapture {
+    pub(crate) checkpoint_generation: u64,
+    pub(crate) checkpoint_max_seqno: u64,
+    pub(crate) checkpoint_data_generation: u64,
+    pub(crate) next_seqno: u64,
+    pub(crate) next_file_id: u64,
+    pub(crate) levels: Vec<ManifestLevelView>,
+    pub(crate) logical_shards: Vec<LogicalShardEntry>,
+}
+
+/// One immutable logical-maintenance input captured from the current owner state.
+#[derive(Clone, Debug)]
+pub(crate) struct LogicalMaintenancePlan {
+    pub(crate) scan_plan: ScanPlan,
+    pub(crate) current_logical_shards: Vec<LogicalShardEntry>,
+    pub(crate) logical_split_bytes: u64,
+    pub(crate) logical_merge_bytes: u64,
+}
+
 /// One fully captured point read over immutable sources beyond the active memtable fast path.
 #[derive(Clone, Debug)]
 pub(crate) struct PointReadPlan {
@@ -428,10 +495,13 @@ pub(crate) struct EngineState {
     next_snapshot_id: u64,
     next_frozen_memtable_id: u64,
     snapshots: HashMap<u64, SnapshotEntry>,
+    snapshot_generation_pins: BTreeMap<u64, usize>,
     pub(crate) current_manifest: Arc<DataManifestSnapshot>,
     manifests_by_generation: BTreeMap<u64, Arc<DataManifestSnapshot>>,
-    current_visible_logical_bytes: HashMap<Vec<u8>, u64>,
-    current_live_size_bytes: u64,
+    current_logical_shards: Vec<LogicalShardEntry>,
+    durable_current: Option<DurableCurrent>,
+    next_checkpoint_generation: u64,
+    checkpoint_capture_paused: bool,
     write_stop_message: Option<String>,
 }
 
@@ -462,10 +532,13 @@ impl EngineState {
             next_snapshot_id: 1,
             next_frozen_memtable_id: 1,
             snapshots: HashMap::new(),
+            snapshot_generation_pins: BTreeMap::new(),
             current_manifest: manifest,
             manifests_by_generation,
-            current_visible_logical_bytes: HashMap::new(),
-            current_live_size_bytes: 0,
+            current_logical_shards: vec![full_keyspace_logical_shard(0)],
+            durable_current: None,
+            next_checkpoint_generation: 1,
+            checkpoint_capture_paused: false,
             write_stop_message: None,
         }
     }
@@ -479,7 +552,16 @@ impl EngineState {
         last_committed_seqno: u64,
         active_memtable: MemtableRef,
         levels: Vec<ManifestLevelView>,
+        logical_shards: Vec<LogicalShardEntry>,
+        durable_current: Option<DurableCurrent>,
+        next_checkpoint_generation: u64,
     ) -> Self {
+        let empty_manifest = Arc::new(DataManifestSnapshot {
+            data_generation: 0,
+            active_memtable: Arc::new(Mutex::new(Memtable::default())),
+            frozen_memtables: Vec::new(),
+            levels: Vec::new(),
+        });
         let manifest = Arc::new(DataManifestSnapshot {
             data_generation,
             active_memtable,
@@ -488,6 +570,7 @@ impl EngineState {
         });
 
         let mut manifests_by_generation = BTreeMap::new();
+        manifests_by_generation.insert(0, empty_manifest);
         manifests_by_generation.insert(data_generation, Arc::clone(&manifest));
 
         Self {
@@ -501,10 +584,13 @@ impl EngineState {
             next_snapshot_id: 1,
             next_frozen_memtable_id: 1,
             snapshots: HashMap::new(),
+            snapshot_generation_pins: BTreeMap::new(),
             current_manifest: manifest,
             manifests_by_generation,
-            current_visible_logical_bytes: HashMap::new(),
-            current_live_size_bytes: 0,
+            current_logical_shards: logical_shards,
+            durable_current,
+            next_checkpoint_generation,
+            checkpoint_capture_paused: false,
             write_stop_message: None,
         }
     }
@@ -537,6 +623,11 @@ impl EngineState {
 
     /// Reserves the next seqno before the durable bytes for that record are written.
     pub(crate) fn reserve_seqno(&mut self) -> Result<u64, Error> {
+        if self.checkpoint_capture_paused {
+            return Err(Error::Corruption(
+                "checkpoint capture pause blocked seqno allocation".into(),
+            ));
+        }
         if let Some(error) = self.write_stop_error() {
             return Err(error);
         }
@@ -560,6 +651,10 @@ impl EngineState {
             data_generation: self.data_generation,
         };
         self.snapshots.insert(snapshot_id, entry);
+        *self
+            .snapshot_generation_pins
+            .entry(entry.data_generation)
+            .or_insert(0) += 1;
         (snapshot_id, entry)
     }
 
@@ -571,7 +666,18 @@ impl EngineState {
 
     /// Releases one active snapshot entry.
     pub(crate) fn release_snapshot_entry(&mut self, snapshot_id: u64) -> Option<SnapshotEntry> {
-        self.snapshots.remove(&snapshot_id)
+        let entry = self.snapshots.remove(&snapshot_id)?;
+        if let Some(pin_count) = self
+            .snapshot_generation_pins
+            .get_mut(&entry.data_generation)
+        {
+            *pin_count -= 1;
+            if *pin_count == 0 {
+                self.snapshot_generation_pins.remove(&entry.data_generation);
+            }
+        }
+        self.prune_retained_manifests();
+        Some(entry)
     }
 
     /// Returns the manifest pinned by one current or historical generation.
@@ -589,19 +695,11 @@ impl EngineState {
             })
     }
 
-    /// Installs the cached current visible logical-byte map used by `stats()`.
-    pub(crate) fn install_visible_bytes_cache(
-        &mut self,
-        visible_logical_bytes: HashMap<Vec<u8>, u64>,
-    ) {
-        self.current_live_size_bytes = visible_logical_bytes.values().sum();
-        self.current_visible_logical_bytes = visible_logical_bytes;
-    }
-
-    /// Returns the latest whole-keyspace live logical bytes for `stats()`.
+    /// Returns the latest current logical-shard map.
+    #[allow(dead_code)]
     #[must_use]
-    pub(crate) fn current_live_size_bytes(&self) -> u64 {
-        self.current_live_size_bytes
+    pub(crate) fn current_logical_shards(&self) -> &[LogicalShardEntry] {
+        &self.current_logical_shards
     }
 
     /// Returns the current `levels[]` stats view without performing file I/O.
@@ -619,14 +717,17 @@ impl EngineState {
             .collect()
     }
 
-    /// Returns the milestone-3 whole-keyspace logical-shard stats view.
+    /// Returns the current `logical_shards[]` stats view without performing file I/O.
     #[must_use]
     pub(crate) fn current_logical_shard_stats(&self) -> Vec<LogicalShardStats> {
-        vec![LogicalShardStats {
-            start_bound: Bound::NegInf,
-            end_bound: Bound::PosInf,
-            live_size_bytes: self.current_live_size_bytes(),
-        }]
+        self.current_logical_shards
+            .iter()
+            .map(|entry| LogicalShardStats {
+                start_bound: entry.start_bound.clone(),
+                end_bound: entry.end_bound.clone(),
+                live_size_bytes: entry.live_size_bytes,
+            })
+            .collect()
     }
 
     /// Advances the durable frontier after one successful explicit `sync()`.
@@ -662,7 +763,6 @@ impl EngineState {
     ) -> Result<(), Error> {
         self.advance_committed_seqno(seqno, durably_synced)?;
         lock_memtable(&self.current_manifest.active_memtable)?.insert(seqno, mutation);
-        self.apply_visible_logical_bytes(mutation);
         self.maybe_freeze_active_memtable()?;
         Ok(())
     }
@@ -766,6 +866,21 @@ impl EngineState {
         })
     }
 
+    /// Captures one full-range exact-byte recomputation over the current logical-shard map.
+    pub(crate) fn plan_logical_maintenance(&self) -> Result<LogicalMaintenancePlan, Error> {
+        Ok(LogicalMaintenancePlan {
+            scan_plan: self.plan_scan(
+                &Bound::NegInf,
+                &Bound::PosInf,
+                self.last_committed_seqno,
+                self.data_generation,
+            )?,
+            current_logical_shards: self.current_logical_shards.clone(),
+            logical_split_bytes: self.config.maintenance.logical_split_bytes,
+            logical_merge_bytes: self.config.maintenance.logical_merge_bytes,
+        })
+    }
+
     /// Publishes one flush result after the WAL record was accepted.
     pub(crate) fn apply_flush_publish(
         &mut self,
@@ -795,6 +910,7 @@ impl EngineState {
             frozen,
             levels,
         );
+        self.prune_retained_manifests();
         Ok(())
     }
 
@@ -825,7 +941,139 @@ impl EngineState {
             self.current_manifest.frozen_memtables.clone(),
             levels,
         );
+        self.prune_retained_manifests();
         Ok(())
+    }
+
+    /// Validates that the current logical-shard source entries still match one captured plan.
+    pub(crate) fn validate_logical_install(
+        &self,
+        payload: &LogicalShardInstallPayload,
+    ) -> Result<(), Error> {
+        let Some((index, matched_len)) =
+            logical_source_match_index(&self.current_logical_shards, &payload.source_entries)
+        else {
+            return Err(Error::Stale(
+                "logical source entries no longer match the current logical-shard map".into(),
+            ));
+        };
+
+        let mut replaced = self.current_logical_shards.clone();
+        replaced.splice(index..index + matched_len, payload.output_entries.clone());
+        validate_logical_shard_list(&replaced).map_err(Error::Corruption)?;
+        Ok(())
+    }
+
+    /// Publishes one logical-shard install after the WAL record was accepted.
+    pub(crate) fn apply_logical_install(
+        &mut self,
+        seqno: u64,
+        durably_synced: bool,
+        payload: &LogicalShardInstallPayload,
+    ) -> Result<(), Error> {
+        self.advance_committed_seqno(seqno, durably_synced)?;
+        self.validate_logical_install(payload)?;
+        let (index, matched_len) =
+            logical_source_match_index(&self.current_logical_shards, &payload.source_entries)
+                .expect("validated logical install should still match");
+        self.current_logical_shards
+            .splice(index..index + matched_len, payload.output_entries.clone());
+        Ok(())
+    }
+
+    /// Returns `true` when the current retained WAL exceeds the configured checkpoint threshold.
+    #[must_use]
+    pub(crate) fn should_checkpoint(&self, retained_wal_bytes: u64) -> bool {
+        let checkpoint_frontier = self
+            .durable_current
+            .as_ref()
+            .map(|current| current.checkpoint_max_seqno)
+            .unwrap_or(0);
+        self.last_committed_seqno > checkpoint_frontier
+            && retained_wal_bytes >= self.config.maintenance.checkpoint_after_wal_bytes
+    }
+
+    /// Marks the checkpoint capture window active before one exact metadata snapshot is taken.
+    pub(crate) fn enter_checkpoint_capture_pause(&mut self) -> Result<(), Error> {
+        if self.checkpoint_capture_paused {
+            return Err(Error::Corruption(
+                "checkpoint capture pause was entered twice".into(),
+            ));
+        }
+        self.checkpoint_capture_paused = true;
+        Ok(())
+    }
+
+    /// Leaves the checkpoint capture window after one exact metadata snapshot is taken.
+    pub(crate) fn leave_checkpoint_capture_pause(&mut self) {
+        self.checkpoint_capture_paused = false;
+    }
+
+    /// Captures the current published-file manifest and current logical-shard map for a checkpoint.
+    pub(crate) fn capture_metadata_checkpoint(&self) -> Result<MetadataCheckpointCapture, Error> {
+        if !self.current_manifest.frozen_memtables.is_empty() {
+            return Err(Error::Corruption(
+                "checkpoint capture requires zero frozen memtables".into(),
+            ));
+        }
+        if !lock_memtable(&self.current_manifest.active_memtable)?.is_empty() {
+            return Err(Error::Corruption(
+                "checkpoint capture requires an empty active memtable".into(),
+            ));
+        }
+
+        Ok(MetadataCheckpointCapture {
+            checkpoint_generation: self.next_checkpoint_generation,
+            checkpoint_max_seqno: self.last_committed_seqno,
+            checkpoint_data_generation: self.data_generation,
+            next_seqno: self.next_seqno,
+            next_file_id: self.next_file_id,
+            levels: self.current_manifest.levels.clone(),
+            logical_shards: self.current_logical_shards.clone(),
+        })
+    }
+
+    /// Installs one newly durable `CURRENT` frontier for later reopen and GC protection.
+    pub(crate) fn install_durable_current(
+        &mut self,
+        checkpoint_generation: u64,
+        checkpoint_max_seqno: u64,
+        checkpoint_data_generation: u64,
+        levels: &[ManifestLevelView],
+    ) {
+        self.durable_current = Some(DurableCurrent {
+            checkpoint_generation,
+            checkpoint_max_seqno,
+            checkpoint_data_generation,
+            file_ids: manifest_file_ids(levels),
+        });
+        self.next_checkpoint_generation = self
+            .next_checkpoint_generation
+            .max(checkpoint_generation.saturating_add(1));
+        self.prune_retained_manifests();
+    }
+
+    /// Returns the current durable checkpoint frontier, if any.
+    #[must_use]
+    pub(crate) fn durable_current(&self) -> Option<&DurableCurrent> {
+        self.durable_current.as_ref()
+    }
+
+    /// Returns every published data file that must be preserved by GC.
+    pub(crate) fn gc_protected_file_ids(&self) -> Result<BTreeSet<u64>, Error> {
+        let mut protected = manifest_file_ids(&self.current_manifest.levels);
+        for generation in self.snapshot_generation_pins.keys() {
+            let Some(manifest) = self.manifests_by_generation.get(generation) else {
+                return Err(Error::Corruption(format!(
+                    "snapshot-pinned manifest generation {generation} was not retained"
+                )));
+            };
+            protected.extend(manifest_file_ids(&manifest.levels));
+        }
+        if let Some(durable_current) = &self.durable_current {
+            protected.extend(durable_current.file_ids.iter().copied());
+        }
+        Ok(protected)
     }
 
     /// Validates that the current flush source still matches the captured plan.
@@ -908,19 +1156,6 @@ impl EngineState {
         Ok(())
     }
 
-    fn apply_visible_logical_bytes(&mut self, mutation: &Mutation) {
-        let key = mutation.key().to_vec();
-        let previous = self.current_visible_logical_bytes.remove(&key).unwrap_or(0);
-        self.current_live_size_bytes = self.current_live_size_bytes.saturating_sub(previous);
-
-        if let Mutation::Put { value, .. } = mutation {
-            let logical_bytes = (key.len() + value.len()) as u64;
-            self.current_live_size_bytes += logical_bytes;
-            self.current_visible_logical_bytes
-                .insert(key, logical_bytes);
-        }
-    }
-
     fn maybe_freeze_active_memtable(&mut self) -> Result<(), Error> {
         let needs_freeze = {
             let active = lock_memtable(&self.current_manifest.active_memtable)?;
@@ -929,7 +1164,39 @@ impl EngineState {
         if !needs_freeze {
             return Ok(());
         }
+        self.force_freeze_active_memtable()
+    }
 
+    /// Freezes the current active memtable whenever it still contains committed records.
+    pub(crate) fn freeze_active_memtable_if_non_empty(&mut self) -> Result<bool, Error> {
+        let was_empty = lock_memtable(&self.current_manifest.active_memtable)?.is_empty();
+        if was_empty {
+            return Ok(false);
+        }
+        self.force_freeze_active_memtable()?;
+        Ok(true)
+    }
+
+    fn install_next_manifest_generation(
+        &mut self,
+        active_memtable: MemtableRef,
+        frozen_memtables: Vec<Arc<FrozenMemtableRef>>,
+        levels: Vec<ManifestLevelView>,
+    ) {
+        let next_generation = self.data_generation + 1;
+        let next_manifest = Arc::new(DataManifestSnapshot {
+            data_generation: next_generation,
+            active_memtable,
+            frozen_memtables,
+            levels,
+        });
+        self.manifests_by_generation
+            .insert(next_generation, Arc::clone(&next_manifest));
+        self.current_manifest = next_manifest;
+        self.data_generation = next_generation;
+    }
+
+    fn force_freeze_active_memtable(&mut self) -> Result<(), Error> {
         let frozen_stats = {
             let active = lock_memtable(&self.current_manifest.active_memtable)?;
             if active.is_empty() {
@@ -960,24 +1227,87 @@ impl EngineState {
         Ok(())
     }
 
-    fn install_next_manifest_generation(
-        &mut self,
-        active_memtable: MemtableRef,
-        frozen_memtables: Vec<Arc<FrozenMemtableRef>>,
-        levels: Vec<ManifestLevelView>,
-    ) {
-        let next_generation = self.data_generation + 1;
-        let next_manifest = Arc::new(DataManifestSnapshot {
-            data_generation: next_generation,
-            active_memtable,
-            frozen_memtables,
-            levels,
-        });
+    fn prune_retained_manifests(&mut self) {
+        let mut retained_generations = BTreeSet::from([0_u64, self.data_generation]);
+        retained_generations.extend(self.snapshot_generation_pins.keys().copied());
+        if let Some(durable_current) = &self.durable_current {
+            retained_generations.insert(durable_current.checkpoint_data_generation);
+        }
+
         self.manifests_by_generation
-            .insert(next_generation, Arc::clone(&next_manifest));
-        self.current_manifest = next_manifest;
-        self.data_generation = next_generation;
+            .retain(|generation, _| retained_generations.contains(generation));
     }
+}
+
+fn full_keyspace_logical_shard(live_size_bytes: u64) -> LogicalShardEntry {
+    LogicalShardEntry {
+        start_bound: Bound::NegInf,
+        end_bound: Bound::PosInf,
+        live_size_bytes,
+    }
+}
+
+// Logical-shard entries are latest-only range metadata, so the state layer
+// keeps them contiguous and ordered before WAL encode/replay ever sees them.
+fn validate_logical_shard_bounds(start_bound: &Bound, end_bound: &Bound) -> Result<(), Error> {
+    if matches!(start_bound, Bound::PosInf) || matches!(end_bound, Bound::NegInf) {
+        return Err(Error::Corruption(
+            "logical shard bounds must use NegInf/Finite for start and Finite/PosInf for end"
+                .into(),
+        ));
+    }
+    if compare_bound(start_bound, end_bound) >= 0 {
+        return Err(Error::Corruption(
+            "logical shard bounds must describe one non-empty range".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_logical_shard_list(entries: &[LogicalShardEntry]) -> Result<(), String> {
+    if entries.is_empty() {
+        return Err("logical shard lists must contain at least one entry".into());
+    }
+
+    for entry in entries {
+        validate_logical_shard_bounds(&entry.start_bound, &entry.end_bound)
+            .map_err(|error| error.to_string())?;
+    }
+
+    for pair in entries.windows(2) {
+        if pair[0].end_bound != pair[1].start_bound {
+            return Err(
+                "logical shard entries must remain contiguous in ascending bound order".into(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// Stale logical installs compare the full captured source entry slice against
+// the current map so split and merge publish stays atomic.
+fn logical_source_match_index(
+    current: &[LogicalShardEntry],
+    source_entries: &[LogicalShardEntry],
+) -> Option<(usize, usize)> {
+    if source_entries.is_empty() {
+        return None;
+    }
+
+    current
+        .windows(source_entries.len())
+        .position(|window| window == source_entries)
+        .map(|index| (index, source_entries.len()))
+}
+
+// GC protects any file still named by the live manifest, a snapshot-pinned
+// historical manifest, or the durable checkpoint referenced by `CURRENT`.
+fn manifest_file_ids(levels: &[ManifestLevelView]) -> BTreeSet<u64> {
+    levels
+        .iter()
+        .flat_map(|level| level.files.iter().map(|file| file.file_id))
+        .collect()
 }
 
 fn push_l0_outputs(levels: &mut Vec<ManifestLevelView>, outputs: Vec<FileMeta>) {
@@ -1114,6 +1444,19 @@ fn ranges_overlap(left_min: &[u8], left_max: &[u8], right_min: &[u8], right_max:
     left_min <= right_max && right_min <= left_max
 }
 
+fn compare_bound(left: &Bound, right: &Bound) -> i8 {
+    match (left, right) {
+        (Bound::NegInf, Bound::NegInf) | (Bound::PosInf, Bound::PosInf) => 0,
+        (Bound::NegInf, _) | (_, Bound::PosInf) => -1,
+        (Bound::PosInf, _) | (_, Bound::NegInf) => 1,
+        (Bound::Finite(left), Bound::Finite(right)) => match left.cmp(right) {
+            Ordering::Less => -1,
+            Ordering::Equal => 0,
+            Ordering::Greater => 1,
+        },
+    }
+}
+
 fn bound_allows_start(bound: &Bound, key: &[u8]) -> bool {
     match bound {
         Bound::NegInf => true,
@@ -1171,7 +1514,6 @@ pub(crate) fn visible_scan_rows(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
     use crate::config::parse_runtime_config;
@@ -1179,8 +1521,8 @@ mod tests {
 
     use super::{
         Bound, CompactPublishPayload, EngineState, FileMeta, FlushPublishPayload, InternalRecord,
-        ManifestLevelView, Memtable, Mutation, RecordKind, compare_internal_to_parts,
-        visible_scan_rows,
+        LogicalShardInstallPayload, ManifestLevelView, Memtable, Mutation, RecordKind,
+        compare_internal_to_parts, visible_scan_rows,
     };
 
     fn test_config() -> crate::config::RuntimeConfig {
@@ -1271,7 +1613,6 @@ mod tests {
     #[test]
     fn flush_publish_rejects_generation_and_source_mismatches() {
         let mut state = EngineState::new(test_config(), 41);
-        state.install_visible_bytes_cache(HashMap::new());
         state
             .apply_live_mutation(
                 1,
@@ -1368,6 +1709,9 @@ mod tests {
                     }],
                 },
             ],
+            vec![super::full_keyspace_logical_shard(0)],
+            None,
+            1,
         );
 
         let stale_generation = CompactPublishPayload {
@@ -1397,6 +1741,28 @@ mod tests {
         };
         assert!(matches!(
             state.validate_compact_publish(&stale_inputs),
+            Err(Error::Stale(_))
+        ));
+    }
+
+    #[test]
+    fn logical_install_rejects_stale_source_entries() {
+        let mut state = EngineState::new(test_config(), 77);
+        let split_payload = LogicalShardInstallPayload {
+            source_entries: state.current_logical_shards().to_vec(),
+            output_entries: vec![
+                super::LogicalShardEntry::new(Bound::NegInf, Bound::Finite(b"m".to_vec()), 0)
+                    .unwrap(),
+                super::LogicalShardEntry::new(Bound::Finite(b"m".to_vec()), Bound::PosInf, 0)
+                    .unwrap(),
+            ],
+        };
+
+        state
+            .apply_logical_install(1, true, &split_payload)
+            .unwrap();
+        assert!(matches!(
+            state.validate_logical_install(&split_payload),
             Err(Error::Stale(_))
         ));
     }

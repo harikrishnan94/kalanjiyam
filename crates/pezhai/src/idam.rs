@@ -67,6 +67,13 @@ impl StoreLayout {
         &self.meta_dir
     }
 
+    /// Returns the canonical metadata-checkpoint filename for one checkpoint generation.
+    #[must_use]
+    pub(crate) fn meta_file_path(&self, checkpoint_generation: u64) -> PathBuf {
+        self.meta_dir
+            .join(format!("meta-{checkpoint_generation:020}.kjm"))
+    }
+
     /// Returns the canonical shared-data directory path.
     #[must_use]
     pub(crate) fn data_dir(&self) -> &Path {
@@ -88,6 +95,18 @@ impl StoreLayout {
     pub(crate) fn temp_data_file_path(&self, tag: &str) -> PathBuf {
         self.data_dir.join(format!(".tmp-{tag}.kjm"))
     }
+
+    /// Returns one non-canonical temporary metadata-checkpoint filename.
+    #[must_use]
+    pub(crate) fn temp_meta_file_path(&self, tag: &str) -> PathBuf {
+        self.meta_dir.join(format!(".tmp-{tag}.kjm"))
+    }
+
+    /// Returns one non-canonical temporary `CURRENT` filename.
+    #[must_use]
+    pub(crate) fn temp_current_path(&self, tag: &str) -> PathBuf {
+        self.store_root.join(format!(".tmp-CURRENT-{tag}"))
+    }
 }
 
 #[cfg(test)]
@@ -106,6 +125,10 @@ mod tests {
         assert_eq!(layout.wal_dir(), Path::new("/srv/pezhai/wal"));
         assert_eq!(layout.meta_dir(), Path::new("/srv/pezhai/meta"));
         assert_eq!(layout.data_dir(), Path::new("/srv/pezhai/data"));
+        assert_eq!(
+            layout.meta_file_path(7),
+            Path::new("/srv/pezhai/meta/meta-00000000000000000007.kjm")
+        );
     }
 
     #[test]
@@ -130,6 +153,14 @@ mod tests {
         assert_eq!(
             layout.temp_data_file_path("flush-12-24"),
             Path::new("/srv/pezhai/data/.tmp-flush-12-24.kjm")
+        );
+        assert_eq!(
+            layout.temp_meta_file_path("checkpoint-9"),
+            Path::new("/srv/pezhai/meta/.tmp-checkpoint-9.kjm")
+        );
+        assert_eq!(
+            layout.temp_current_path("checkpoint-9"),
+            Path::new("/srv/pezhai/.tmp-CURRENT-checkpoint-9")
         );
     }
 }
