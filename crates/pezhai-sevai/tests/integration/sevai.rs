@@ -76,7 +76,7 @@ async fn framed_tcp_round_trip_returns_expected_payloads() {
             assert!(payload.found);
             assert_eq!(payload.value.as_deref(), Some(&b"value-1"[..]));
             assert_eq!(payload.observation_seqno, 1);
-            assert_eq!(payload.data_generation, 1);
+            assert_eq!(payload.data_generation, 0);
         }
         other => panic!("unexpected payload: {other:?}"),
     }
@@ -102,7 +102,7 @@ async fn framed_tcp_round_trip_returns_expected_payloads() {
     match stats_response.payload {
         Some(wire::response_envelope::Payload::Stats(payload)) => {
             assert_eq!(payload.observation_seqno, 1);
-            assert_eq!(payload.data_generation, 1);
+            assert_eq!(payload.data_generation, 0);
             assert_eq!(payload.levels.len(), 0);
             assert_eq!(payload.logical_shards.len(), 1);
         }
@@ -278,7 +278,9 @@ fn write_test_config(addr: SocketAddr) -> PathBuf {
         .unwrap()
         .as_nanos();
     let config_id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("pezhai-integration-{unique}-{config_id}.toml"));
+    let root = std::env::temp_dir().join(format!("pezhai-integration-{unique}-{config_id}"));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("config.toml");
     fs::write(
         &path,
         format!(

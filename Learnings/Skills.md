@@ -28,6 +28,18 @@ cargo run -p pezhai-sevai -- --config /path/to/config.toml
 The shared config schema currently includes `[engine]`, `[wal]`, `[lsm]`,
 `[maintenance]`, `[server_limits]`, and `[sevai]`.
 
+## Runtime
+
+`pezhai-sevai` now wires the milestone-5 runtime described in
+`docs/arch/sevai.md`. Every RPC traverses the owner actor, whose state
+includes the embedded `EngineState`, owner WAL append state, scan sessions,
+durability waiters, cancellation index, and maintenance trackers. A bounded
+external queue feeds the owner, while an unbounded control channel handles
+cancellation, shutdown, worker completions, WAL sync updates, maintenance
+results, and expiry ticks. Worker tasks, a WAL sync actor, and the existing
+adapter remain thin, keeping most blocking work isolated inside the owner
+runtime and the worker pool.
+
 ## Test
 
 Run all unit and integration tests:

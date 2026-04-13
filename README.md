@@ -32,6 +32,17 @@ Run the server locally with:
 cargo run -p pezhai-sevai -- --config /path/to/config.toml
 ```
 
+## Server runtime
+
+The TCP server now runs the milestone-5 engine-backed runtime described in
+`docs/arch/sevai.md`. Incoming RPCs flow through a bounded external queue,
+while an unbounded control channel handles cancel, shutdown, worker, WAL sync,
+and maintenance signals so control traffic is never blocked by heavy load.
+The owner actor embeds the engine state, the owner-owned WAL append data, the
+scan session table, and the durability waiters, while a worker pool and WAL
+sync actor implement file-backed reads and durable commits off-thread. This
+runtime is fully described in the architecture doc.
+
 ## Python Benchmarks
 
 The repository also includes a supported Python benchmark workflow for

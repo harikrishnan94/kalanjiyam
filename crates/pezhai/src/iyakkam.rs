@@ -10,21 +10,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::task;
 
-use crate::config::load_runtime_config;
+use crate::config::{RuntimeConfig, SyncMode, load_runtime_config};
 use crate::error::Error;
 use crate::idam::StoreLayout;
 use crate::nilaimai::{
-    CompactPublishPayload, DurableCurrent, EngineState, FlushPublishPayload,
-    LogicalShardInstallPayload, Memtable, MemtableRef, Mutation,
+    CompactPublishPayload, CompactionBuildResult, CompactionPlan, DurableCurrent, EngineState,
+    FlushBuildResult, FlushPlan, FlushPublishPayload, LogicalShardInstallPayload, Memtable,
+    MemtableRef, Mutation, PointReadPlan,
 };
 use crate::pani::{
-    build_compaction_output, build_flush_output, execute_gc, execute_logical_maintenance_plan,
-    execute_point_read, execute_scan_plan,
+    ScanPagePlan, build_compaction_output, build_flush_output, execute_gc,
+    execute_logical_maintenance_plan, execute_point_read, execute_scan_plan,
 };
 use crate::pathivu::{
-    CurrentFile, MAX_KEY_BYTES, MAX_VALUE_BYTES, ReplaySeed, WalRecovery, WalWriter,
-    WalWriterTestOptions, build_temp_metadata_checkpoint_file, install_current,
-    install_metadata_checkpoint, list_canonical_data_file_ids, read_current,
+    AppendOutcome, CurrentFile, MAX_KEY_BYTES, MAX_VALUE_BYTES, ReplaySeed, WalAppendState,
+    WalRecovery, WalWriter, WalWriterTestOptions, build_temp_metadata_checkpoint_file,
+    install_current, install_metadata_checkpoint, list_canonical_data_file_ids, read_current,
     read_metadata_checkpoint, recover_wal, retained_wal_bytes_after,
     truncate_covered_closed_wal_segments,
 };
@@ -192,6 +193,27 @@ struct DeferredScanExecution {
     plan: crate::nilaimai::ScanPlan,
 }
 
+/// One opened engine runtime that keeps the mutable state and append owner separate from the public shell.
+pub(crate) struct OpenedEngineRuntime {
+    pub(crate) layout: StoreLayout,
+    pub(crate) state: EngineState,
+    pub(crate) wal_append_state: WalAppendState,
+}
+
+/// One resolved read snapshot used by both the direct engine and the sevai owner actor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResolvedSnapshot {
+    pub(crate) snapshot_seqno: u64,
+    pub(crate) data_generation: u64,
+}
+
+/// One captured `Get` execution that either completes inline or needs worker execution.
+#[derive(Clone, Debug)]
+pub(crate) enum CapturedGet {
+    Inline(Option<Vec<u8>>),
+    Deferred(PointReadPlan),
+}
+
 /// Result payload returned by `sync()`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use = "the durable frontier result explains what `sync()` covered"]
@@ -223,14 +245,7 @@ impl PezhaiEngine {
     /// Creates one stable snapshot handle pinned to the current committed frontier.
     pub async fn create_snapshot(&self) -> Result<SnapshotHandle, Error> {
         let mut state = self.core.lock_state()?;
-        let engine_instance_id = state.engine_instance_id();
-        let (snapshot_id, entry) = state.create_snapshot_entry();
-        Ok(SnapshotHandle {
-            engine_instance_id,
-            snapshot_id,
-            snapshot_seqno: entry.snapshot_seqno,
-            data_generation: entry.data_generation,
-        })
+        Ok(create_snapshot_handle(&mut state))
     }
 
     /// Releases one previously created snapshot handle.
@@ -239,23 +254,7 @@ impl PezhaiEngine {
     /// live engine instance.
     pub async fn release_snapshot(&self, handle: SnapshotHandle) -> Result<(), Error> {
         let mut state = self.core.lock_state()?;
-        if handle.engine_instance_id != state.engine_instance_id() {
-            return Err(Error::InvalidArgument(
-                "snapshot handle does not belong to this open engine instance".into(),
-            ));
-        }
-
-        match state.release_snapshot_entry(handle.snapshot_id) {
-            Some(entry)
-                if entry.snapshot_seqno == handle.snapshot_seqno
-                    && entry.data_generation == handle.data_generation =>
-            {
-                Ok(())
-            }
-            Some(_) | None => Err(Error::InvalidArgument(
-                "snapshot handle is unknown or already released".into(),
-            )),
-        }
+        release_snapshot_handle(&mut state, &handle)
     }
 
     /// Inserts or replaces one key/value pair.
@@ -310,25 +309,20 @@ impl PezhaiEngine {
         snapshot: Option<&SnapshotHandle>,
     ) -> Result<GetResponse, Error> {
         validate_key(key)?;
-        let (snapshot_seqno, data_generation, plan) = {
+        let (snapshot, plan) = {
             let state = self.core.lock_state()?;
-            let (snapshot_seqno, data_generation) = resolve_snapshot(&state, snapshot)?;
-            if let Some(active_result) =
-                state.active_memtable_result(data_generation, key, snapshot_seqno)?
-            {
-                return Ok(GetResponse {
-                    found: active_result.is_some(),
-                    value: active_result,
-                    observation_seqno: snapshot_seqno,
-                    data_generation,
-                });
+            let snapshot = resolve_snapshot_for_read(&state, snapshot)?;
+            match capture_get_request(&state, key, snapshot)? {
+                CapturedGet::Inline(active_result) => {
+                    return Ok(GetResponse {
+                        found: active_result.is_some(),
+                        value: active_result,
+                        observation_seqno: snapshot.snapshot_seqno,
+                        data_generation: snapshot.data_generation,
+                    });
+                }
+                CapturedGet::Deferred(plan) => (snapshot, plan),
             }
-
-            (
-                snapshot_seqno,
-                data_generation,
-                state.plan_point_read(key, snapshot_seqno, data_generation)?,
-            )
         };
 
         let layout = self.core.layout.clone();
@@ -339,8 +333,8 @@ impl PezhaiEngine {
         Ok(GetResponse {
             found: value.is_some(),
             value,
-            observation_seqno: snapshot_seqno,
-            data_generation,
+            observation_seqno: snapshot.snapshot_seqno,
+            data_generation: snapshot.data_generation,
         })
     }
 
@@ -408,85 +402,19 @@ impl PezhaiEngine {
     /// Returns the current engine stats view without performing external I/O.
     pub async fn stats(&self) -> Result<StatsResponse, Error> {
         let state = self.core.lock_state()?;
-        Ok(StatsResponse {
-            observation_seqno: state.last_committed_seqno,
-            data_generation: state.data_generation,
-            levels: state.current_level_stats(),
-            logical_shards: state.current_logical_shard_stats(),
-        })
+        Ok(collect_stats_response(&state))
     }
 
     fn open_with_options(config_path: &Path, options: EngineTestOptions) -> Result<Self, Error> {
         let config = load_runtime_config(config_path).map_err(Error::from)?;
-        let layout = StoreLayout::from_config_path(config_path);
-        fs::create_dir_all(layout.wal_dir()).map_err(Error::Io)?;
-        fs::create_dir_all(layout.meta_dir()).map_err(Error::Io)?;
-        fs::create_dir_all(layout.data_dir()).map_err(Error::Io)?;
-
-        let checkpoint_seed = match read_current(&layout)? {
-            Some(current)
-                if current.checkpoint_generation != 0
-                    || current.checkpoint_max_seqno != 0
-                    || current.checkpoint_data_generation != 0 =>
-            {
-                let checkpoint = read_metadata_checkpoint(&layout, current.checkpoint_generation)?;
-                if checkpoint.checkpoint_max_seqno != current.checkpoint_max_seqno
-                    || checkpoint.checkpoint_data_generation != current.checkpoint_data_generation
-                {
-                    return Err(Error::Corruption(
-                        "CURRENT did not match the referenced metadata checkpoint".into(),
-                    ));
-                }
-                Some(checkpoint)
-            }
-            _ => None,
-        };
-
-        let WalRecovery {
-            pending_mutations,
-            levels,
-            logical_shards,
-            last_committed_seqno,
-            data_generation,
-            next_file_id,
-            active_segment,
-        } = recover_wal(&layout, config.wal.segment_bytes, checkpoint_seed.as_ref())?;
-        let engine_instance_id = NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
-        let active_memtable: MemtableRef = Arc::new(Mutex::new(Memtable::default()));
-        for recovered in &pending_mutations {
-            EngineState::apply_recovered_mutation(
-                &active_memtable,
-                recovered.seqno,
-                &recovered.mutation,
-            )?;
-        }
-        let state = EngineState::from_recovery(
-            config.clone(),
-            engine_instance_id,
-            data_generation,
-            next_file_id,
-            last_committed_seqno,
-            active_memtable,
-            levels,
-            logical_shards,
-            checkpoint_seed.as_ref().map(durable_current_from_seed),
-            checkpoint_seed
-                .as_ref()
-                .map_or(1, |seed| seed.checkpoint_generation.saturating_add(1)),
-        );
-
-        let writer = WalWriter::open(
-            layout.clone(),
-            config.wal.segment_bytes,
-            active_segment,
-            options.wal_writer,
-        )?;
+        let opened = open_engine_runtime(config_path, config.clone(), options)?;
         let core = Arc::new(EngineCore {
-            state: Mutex::new(state),
-            layout,
+            state: Mutex::new(opened.state),
+            layout: opened.layout,
         });
         let (command_tx, command_rx) = mpsc::channel();
         let worker_core = Arc::clone(&core);
+        let writer = WalWriter::from_append_state(opened.wal_append_state);
         let join_handle = std::thread::Builder::new()
             .name("pezhai-wal".into())
             .spawn(move || wal_worker_loop(worker_core, writer, command_rx))
@@ -554,8 +482,8 @@ enum WalCommand {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct EngineTestOptions {
-    wal_writer: WalWriterTestOptions,
+pub(crate) struct EngineTestOptions {
+    pub(crate) wal_writer: WalWriterTestOptions,
 }
 
 fn wal_worker_loop(
@@ -568,32 +496,14 @@ fn wal_worker_loop(
             WalCommand::AppendMutation { mutation, reply } => {
                 let result = match core.lock_state() {
                     Ok(mut state) => {
-                        let seqno = match state.reserve_seqno() {
-                            Ok(seqno) => seqno,
-                            Err(error) => {
-                                let _ = reply.send(Err(error));
-                                continue;
-                            }
-                        };
                         let sync_mode = state.sync_mode();
-                        drop(state);
-
-                        match writer.append_mutation(seqno, &mutation, sync_mode) {
-                            Ok(outcome) => match core.lock_state() {
-                                Ok(mut state) => state.apply_live_mutation(
-                                    seqno,
-                                    &mutation,
-                                    outcome.durably_synced,
-                                ),
-                                Err(error) => Err(error),
-                            },
-                            Err(error) => {
-                                if let Ok(mut state) = core.lock_state() {
-                                    state.mark_write_failed(error.to_string());
-                                }
-                                Err(error)
-                            }
-                        }
+                        append_live_mutation(
+                            &mut state,
+                            writer.append_state_mut(),
+                            &mutation,
+                            sync_mode,
+                        )
+                        .map(|_outcome| ())
                     }
                     Err(error) => Err(error),
                 };
@@ -737,24 +647,16 @@ fn publish_flush_plan(
 ) -> Result<(), Error> {
     let build = build_flush_output(&core.layout, page_size_bytes, &plan)?;
     let mut state = core.lock_state()?;
-    let file_id = allocate_unused_file_id(&core.layout, state.next_file_id);
-    let output_file_meta = build.summary.to_file_meta(file_id, 0);
-    let payload = FlushPublishPayload {
-        data_generation_expected: plan.data_generation_expected,
-        source_first_seqno: plan.source.source_first_seqno,
-        source_last_seqno: plan.source.source_last_seqno,
-        source_record_count: plan.source.source_record_count,
-        output_file_metas: vec![output_file_meta.clone()],
-    };
-    state.validate_flush_publish(&payload)?;
-
-    fs::rename(&build.temp_path, core.layout.data_file_path(file_id)).map_err(Error::Io)?;
-    sync_directory(core.layout.data_dir())?;
-
-    let seqno = state.reserve_seqno()?;
     let sync_mode = state.sync_mode();
-    match writer.append_flush_publish(seqno, &payload, sync_mode) {
-        Ok(outcome) => state.apply_flush_publish(seqno, outcome.durably_synced, &payload),
+    match publish_flush_build(
+        &mut state,
+        writer.append_state_mut(),
+        &core.layout,
+        &plan,
+        &build,
+        sync_mode,
+    ) {
+        Ok(_outcome) => Ok(()),
         Err(error) => {
             state.mark_write_failed(error.to_string());
             Err(error)
@@ -770,30 +672,16 @@ fn publish_compaction_plan(
 ) -> Result<(), Error> {
     let build = build_compaction_output(&core.layout, page_size_bytes, &plan)?;
     let mut state = core.lock_state()?;
-    let file_id = allocate_unused_file_id(&core.layout, state.next_file_id);
-    let output_file_meta = build.summary.to_file_meta(file_id, plan.output_level_no);
-    let payload = CompactPublishPayload {
-        data_generation_expected: plan.data_generation_expected,
-        input_file_ids: {
-            let mut ids = plan
-                .input_files
-                .iter()
-                .map(|file| file.file_id)
-                .collect::<Vec<_>>();
-            ids.sort_unstable();
-            ids
-        },
-        output_file_metas: vec![output_file_meta.clone()],
-    };
-    state.validate_compact_publish(&payload)?;
-
-    fs::rename(&build.temp_path, core.layout.data_file_path(file_id)).map_err(Error::Io)?;
-    sync_directory(core.layout.data_dir())?;
-
-    let seqno = state.reserve_seqno()?;
     let sync_mode = state.sync_mode();
-    match writer.append_compact_publish(seqno, &payload, sync_mode) {
-        Ok(outcome) => state.apply_compact_publish(seqno, outcome.durably_synced, &payload),
+    match publish_compaction_build(
+        &mut state,
+        writer.append_state_mut(),
+        &core.layout,
+        &plan,
+        &build,
+        sync_mode,
+    ) {
+        Ok(_outcome) => Ok(()),
         Err(error) => {
             state.mark_write_failed(error.to_string());
             Err(error)
@@ -809,12 +697,10 @@ fn publish_logical_install(
     payload: &LogicalShardInstallPayload,
 ) -> Result<(), Error> {
     let mut state = core.lock_state()?;
-    state.validate_logical_install(payload)?;
-
-    let seqno = state.reserve_seqno()?;
     let sync_mode = state.sync_mode();
-    match writer.append_logical_shard_install(seqno, payload, sync_mode) {
-        Ok(outcome) => state.apply_logical_install(seqno, outcome.durably_synced, payload),
+    match publish_logical_install_payload(&mut state, writer.append_state_mut(), payload, sync_mode)
+    {
+        Ok(_outcome) => Ok(()),
         Err(error) => {
             state.mark_write_failed(error.to_string());
             Err(error)
@@ -902,6 +788,83 @@ fn install_checkpoint(
     Ok(())
 }
 
+/// Opens the mutable engine state and owner-owned WAL append state shared by the direct engine and sevai.
+pub(crate) fn open_engine_runtime(
+    config_path: &Path,
+    config: RuntimeConfig,
+    options: EngineTestOptions,
+) -> Result<OpenedEngineRuntime, Error> {
+    let layout = StoreLayout::from_config_path(config_path);
+    let segment_bytes = config.wal.segment_bytes;
+    fs::create_dir_all(layout.wal_dir()).map_err(Error::Io)?;
+    fs::create_dir_all(layout.meta_dir()).map_err(Error::Io)?;
+    fs::create_dir_all(layout.data_dir()).map_err(Error::Io)?;
+
+    let checkpoint_seed = match read_current(&layout)? {
+        Some(current)
+            if current.checkpoint_generation != 0
+                || current.checkpoint_max_seqno != 0
+                || current.checkpoint_data_generation != 0 =>
+        {
+            let checkpoint = read_metadata_checkpoint(&layout, current.checkpoint_generation)?;
+            if checkpoint.checkpoint_max_seqno != current.checkpoint_max_seqno
+                || checkpoint.checkpoint_data_generation != current.checkpoint_data_generation
+            {
+                return Err(Error::Corruption(
+                    "CURRENT did not match the referenced metadata checkpoint".into(),
+                ));
+            }
+            Some(checkpoint)
+        }
+        _ => None,
+    };
+
+    let WalRecovery {
+        pending_mutations,
+        levels,
+        logical_shards,
+        last_committed_seqno,
+        data_generation,
+        next_file_id,
+        active_segment,
+    } = recover_wal(&layout, segment_bytes, checkpoint_seed.as_ref())?;
+    let engine_instance_id = NEXT_ENGINE_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+    let active_memtable: MemtableRef = Arc::new(Mutex::new(Memtable::default()));
+    for recovered in &pending_mutations {
+        EngineState::apply_recovered_mutation(
+            &active_memtable,
+            recovered.seqno,
+            &recovered.mutation,
+        )?;
+    }
+    let state = EngineState::from_recovery(
+        config,
+        engine_instance_id,
+        data_generation,
+        next_file_id,
+        last_committed_seqno,
+        active_memtable,
+        levels,
+        logical_shards,
+        checkpoint_seed.as_ref().map(durable_current_from_seed),
+        checkpoint_seed
+            .as_ref()
+            .map_or(1, |seed| seed.checkpoint_generation.saturating_add(1)),
+    );
+    let wal_append_state = WalAppendState::open(
+        layout.clone(),
+        segment_bytes,
+        active_segment,
+        options.wal_writer,
+    )?;
+
+    Ok(OpenedEngineRuntime {
+        layout,
+        state,
+        wal_append_state,
+    })
+}
+
 // Reopen keeps the durable `CURRENT` frontier separate from the mutable live
 // manifest so GC can preserve checkpoint-pinned files after later publishes.
 fn durable_current_from_seed(seed: &ReplaySeed) -> DurableCurrent {
@@ -915,6 +878,254 @@ fn durable_current_from_seed(seed: &ReplaySeed) -> DurableCurrent {
             .flat_map(|level| level.files.iter().map(|file| file.file_id))
             .collect(),
     }
+}
+
+/// Resolves the latest implicit snapshot used by latest-only reads and new scan sessions.
+#[must_use]
+pub(crate) fn resolve_latest_snapshot(state: &EngineState) -> ResolvedSnapshot {
+    ResolvedSnapshot {
+        snapshot_seqno: state.last_committed_seqno,
+        data_generation: state.data_generation,
+    }
+}
+
+/// Resolves an explicit or implicit read snapshot against the live engine state.
+pub(crate) fn resolve_snapshot_for_read(
+    state: &EngineState,
+    snapshot: Option<&SnapshotHandle>,
+) -> Result<ResolvedSnapshot, Error> {
+    let (snapshot_seqno, data_generation) = resolve_snapshot(state, snapshot)?;
+    Ok(ResolvedSnapshot {
+        snapshot_seqno,
+        data_generation,
+    })
+}
+
+/// Creates one tracked snapshot handle pinned to the current visible generation.
+pub(crate) fn create_snapshot_handle(state: &mut EngineState) -> SnapshotHandle {
+    let engine_instance_id = state.engine_instance_id();
+    let (snapshot_id, entry) = state.create_snapshot_entry();
+    SnapshotHandle {
+        engine_instance_id,
+        snapshot_id,
+        snapshot_seqno: entry.snapshot_seqno,
+        data_generation: entry.data_generation,
+    }
+}
+
+/// Releases one previously created snapshot handle.
+pub(crate) fn release_snapshot_handle(
+    state: &mut EngineState,
+    handle: &SnapshotHandle,
+) -> Result<(), Error> {
+    if handle.engine_instance_id != state.engine_instance_id() {
+        return Err(Error::InvalidArgument(
+            "snapshot handle does not belong to this open engine instance".into(),
+        ));
+    }
+
+    match state.release_snapshot_entry(handle.snapshot_id) {
+        Some(entry)
+            if entry.snapshot_seqno == handle.snapshot_seqno
+                && entry.data_generation == handle.data_generation =>
+        {
+            Ok(())
+        }
+        Some(_) | None => Err(Error::InvalidArgument(
+            "snapshot handle is unknown or already released".into(),
+        )),
+    }
+}
+
+/// Captures the direct-engine `Get` fast path or one immutable point-read plan.
+pub(crate) fn capture_get_request(
+    state: &EngineState,
+    key: &[u8],
+    snapshot: ResolvedSnapshot,
+) -> Result<CapturedGet, Error> {
+    if let Some(active_result) =
+        state.active_memtable_result(snapshot.data_generation, key, snapshot.snapshot_seqno)?
+    {
+        return Ok(CapturedGet::Inline(active_result));
+    }
+
+    Ok(CapturedGet::Deferred(state.plan_point_read(
+        key,
+        snapshot.snapshot_seqno,
+        snapshot.data_generation,
+    )?))
+}
+
+/// Captures one page-oriented scan plan pinned to one tracked snapshot handle.
+pub(crate) fn capture_scan_page_request(
+    state: &EngineState,
+    scan_id: u64,
+    snapshot_handle: &SnapshotHandle,
+    start_bound: &Bound,
+    end_bound: &Bound,
+    resume_after_key: Option<Vec<u8>>,
+    max_records_per_page: u32,
+    max_bytes_per_page: u32,
+) -> Result<ScanPagePlan, Error> {
+    let snapshot = resolve_snapshot_for_read(state, Some(snapshot_handle))?;
+    Ok(ScanPagePlan {
+        scan_id,
+        snapshot_handle: snapshot_handle.clone(),
+        scan_plan: state.plan_scan(
+            start_bound,
+            end_bound,
+            snapshot.snapshot_seqno,
+            snapshot.data_generation,
+        )?,
+        resume_after_key,
+        max_records_per_page,
+        max_bytes_per_page,
+    })
+}
+
+/// Returns the current owner-local stats view without doing external I/O.
+#[must_use]
+pub(crate) fn collect_stats_response(state: &EngineState) -> StatsResponse {
+    StatsResponse {
+        observation_seqno: state.last_committed_seqno,
+        data_generation: state.data_generation,
+        levels: state.current_level_stats(),
+        logical_shards: state.current_logical_shard_stats(),
+    }
+}
+
+/// Reserves a seqno, appends one mutation, and installs it in the active memtable.
+pub(crate) fn append_live_mutation(
+    state: &mut EngineState,
+    wal_append_state: &mut WalAppendState,
+    mutation: &Mutation,
+    sync_mode: SyncMode,
+) -> Result<AppendOutcome, Error> {
+    let seqno = state.reserve_seqno()?;
+    let outcome = match wal_append_state.append_mutation(seqno, mutation, sync_mode) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.mark_write_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    state.apply_live_mutation(seqno, mutation, outcome.durably_synced)?;
+    Ok(outcome)
+}
+
+/// Reserves a seqno, appends one mutation, and installs it without forcing durability yet.
+pub(crate) fn append_live_mutation_unsynced(
+    state: &mut EngineState,
+    wal_append_state: &mut WalAppendState,
+    mutation: &Mutation,
+) -> Result<AppendOutcome, Error> {
+    let seqno = state.reserve_seqno()?;
+    let outcome = match wal_append_state.append_mutation_unsynced(seqno, mutation) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.mark_write_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    state.apply_live_mutation(seqno, mutation, false)?;
+    Ok(outcome)
+}
+
+/// Validates and publishes one flush build result through the shared engine-owned WAL path.
+pub(crate) fn publish_flush_build(
+    state: &mut EngineState,
+    wal_append_state: &mut WalAppendState,
+    layout: &StoreLayout,
+    plan: &FlushPlan,
+    build: &FlushBuildResult,
+    sync_mode: SyncMode,
+) -> Result<AppendOutcome, Error> {
+    let file_id = allocate_unused_file_id(layout, state.next_file_id);
+    let output_file_meta = build.summary.to_file_meta(file_id, 0);
+    let payload = FlushPublishPayload {
+        data_generation_expected: plan.data_generation_expected,
+        source_first_seqno: plan.source.source_first_seqno,
+        source_last_seqno: plan.source.source_last_seqno,
+        source_record_count: plan.source.source_record_count,
+        output_file_metas: vec![output_file_meta.clone()],
+    };
+    state.validate_flush_publish(&payload)?;
+
+    fs::rename(&build.temp_path, layout.data_file_path(file_id)).map_err(Error::Io)?;
+    sync_directory(layout.data_dir())?;
+
+    let seqno = state.reserve_seqno()?;
+    let outcome = match wal_append_state.append_flush_publish(seqno, &payload, sync_mode) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.mark_write_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    state.apply_flush_publish(seqno, outcome.durably_synced, &payload)?;
+    Ok(outcome)
+}
+
+/// Validates and publishes one compaction build result through the shared engine-owned WAL path.
+pub(crate) fn publish_compaction_build(
+    state: &mut EngineState,
+    wal_append_state: &mut WalAppendState,
+    layout: &StoreLayout,
+    plan: &CompactionPlan,
+    build: &CompactionBuildResult,
+    sync_mode: SyncMode,
+) -> Result<AppendOutcome, Error> {
+    let file_id = allocate_unused_file_id(layout, state.next_file_id);
+    let output_file_meta = build.summary.to_file_meta(file_id, plan.output_level_no);
+    let payload = CompactPublishPayload {
+        data_generation_expected: plan.data_generation_expected,
+        input_file_ids: {
+            let mut ids = plan
+                .input_files
+                .iter()
+                .map(|file| file.file_id)
+                .collect::<Vec<_>>();
+            ids.sort_unstable();
+            ids
+        },
+        output_file_metas: vec![output_file_meta.clone()],
+    };
+    state.validate_compact_publish(&payload)?;
+
+    fs::rename(&build.temp_path, layout.data_file_path(file_id)).map_err(Error::Io)?;
+    sync_directory(layout.data_dir())?;
+
+    let seqno = state.reserve_seqno()?;
+    let outcome = match wal_append_state.append_compact_publish(seqno, &payload, sync_mode) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.mark_write_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    state.apply_compact_publish(seqno, outcome.durably_synced, &payload)?;
+    Ok(outcome)
+}
+
+/// Validates and publishes one logical-shard install through the shared engine-owned WAL path.
+pub(crate) fn publish_logical_install_payload(
+    state: &mut EngineState,
+    wal_append_state: &mut WalAppendState,
+    payload: &LogicalShardInstallPayload,
+    sync_mode: SyncMode,
+) -> Result<AppendOutcome, Error> {
+    state.validate_logical_install(payload)?;
+
+    let seqno = state.reserve_seqno()?;
+    let outcome = match wal_append_state.append_logical_shard_install(seqno, payload, sync_mode) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.mark_write_failed(error.to_string());
+            return Err(error);
+        }
+    };
+    state.apply_logical_install(seqno, outcome.durably_synced, payload)?;
+    Ok(outcome)
 }
 
 fn resolve_snapshot(
@@ -948,18 +1159,18 @@ fn resolve_snapshot(
     }
 }
 
-fn validate_key(key: &[u8]) -> Result<(), Error> {
+pub(crate) fn validate_key(key: &[u8]) -> Result<(), Error> {
     if key.is_empty() {
         return Err(Error::InvalidArgument("key must not be empty".into()));
     }
     validate_max_length(key.len(), MAX_KEY_BYTES, "key")
 }
 
-fn validate_value(value: &[u8]) -> Result<(), Error> {
+pub(crate) fn validate_value(value: &[u8]) -> Result<(), Error> {
     validate_max_length(value.len(), MAX_VALUE_BYTES, "value")
 }
 
-fn validate_max_length(length: usize, limit: usize, subject: &str) -> Result<(), Error> {
+pub(crate) fn validate_max_length(length: usize, limit: usize, subject: &str) -> Result<(), Error> {
     if length > limit {
         return Err(Error::InvalidArgument(format!(
             "{subject} exceeds the {limit}-byte limit"
@@ -969,7 +1180,7 @@ fn validate_max_length(length: usize, limit: usize, subject: &str) -> Result<(),
     Ok(())
 }
 
-fn validate_scan_range(start_bound: &Bound, end_bound: &Bound) -> Result<(), Error> {
+pub(crate) fn validate_scan_range(start_bound: &Bound, end_bound: &Bound) -> Result<(), Error> {
     if matches!(start_bound, Bound::PosInf) || matches!(end_bound, Bound::NegInf) {
         return Err(Error::InvalidArgument(
             "scan range must use NegInf/Finite for start and Finite/PosInf for end".into(),
@@ -984,7 +1195,7 @@ fn validate_scan_range(start_bound: &Bound, end_bound: &Bound) -> Result<(), Err
     Ok(())
 }
 
-fn compare_bound(left: &Bound, right: &Bound) -> i8 {
+pub(crate) fn compare_bound(left: &Bound, right: &Bound) -> i8 {
     match (left, right) {
         (Bound::NegInf, Bound::NegInf) | (Bound::PosInf, Bound::PosInf) => 0,
         (Bound::NegInf, _) | (_, Bound::PosInf) => -1,
@@ -1324,6 +1535,7 @@ checkpoint_after_wal_bytes = 1073741824
         let options = EngineTestOptions {
             wal_writer: WalWriterTestOptions {
                 fail_at_seqno: Some(1),
+                fail_sync_at_seqno: None,
             },
         };
         let engine = PezhaiEngine::open_with_options(&config_path, options).unwrap();
@@ -1431,6 +1643,7 @@ l0_file_threshold = 2
         let options = EngineTestOptions {
             wal_writer: WalWriterTestOptions {
                 fail_at_seqno: Some(3),
+                fail_sync_at_seqno: None,
             },
         };
         let engine = PezhaiEngine::open_with_options(&config_path, options).unwrap();

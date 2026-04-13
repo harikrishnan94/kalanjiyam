@@ -2,6 +2,8 @@
 
 #[cfg(test)]
 use std::future::Future;
+use std::future::poll_fn;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use buffa::{EnumValue, Message};
 use pezhai::Error;
@@ -10,7 +12,7 @@ use pezhai::sevai::{
     ExternalResponsePayload, GetRequest, PezhaiServer, PutRequest, ScanFetchNextRequest,
     ScanStartRequest, StatsRequest, Status, StatusCode,
 };
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
 
@@ -21,6 +23,7 @@ mod generated {
 use generated::kalanjiyam::sevai::v1 as wire;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+static NEXT_HIDDEN_CANCEL_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 /// Runs the raw TCP adapter against the listen address configured in `PezhaiServer`.
 pub async fn run_tcp_adapter(server: PezhaiServer) -> Result<(), Error> {
@@ -62,10 +65,6 @@ pub async fn run_tcp_adapter(server: PezhaiServer) -> Result<(), Error> {
 
 async fn serve_connection(server: PezhaiServer, stream: TcpStream) -> Result<(), Error> {
     let mut stream = stream;
-    let call_server = |request| {
-        let server = server.clone();
-        async move { dispatch_server_call(server, request).await }
-    };
 
     loop {
         tokio::select! {
@@ -78,11 +77,29 @@ async fn serve_connection(server: PezhaiServer, stream: TcpStream) -> Result<(),
                     Some(request) => request,
                     None => break,
                 };
-                let response = match request {
-                    DecodedRequest::Valid(request) => call_server(request).await,
-                    DecodedRequest::Invalid(response) => response,
-                };
-                write_response_frame(&mut stream, &response).await?;
+                match request {
+                    DecodedRequest::Valid(mut request) => {
+                        let cancel_token = ensure_effective_cancel_token(&mut request);
+                        let client_id = request.client_id.clone();
+                        let response = match dispatch_server_call_with_disconnect(
+                            server.clone(),
+                            &stream,
+                            request,
+                        )
+                        .await?
+                        {
+                            Some(response) => response,
+                            None => break,
+                        };
+                        if let Err(error) = write_response_frame(&mut stream, &response).await {
+                            let _ = server.cancel(client_id, cancel_token).await;
+                            return Err(error);
+                        }
+                    }
+                    DecodedRequest::Invalid(response) => {
+                        write_response_frame(&mut stream, &response).await?;
+                    }
+                }
             }
         }
     }
@@ -166,6 +183,7 @@ where
 }
 
 // Call into the logical server and map a stopped owner task into one transport-visible response.
+#[cfg(test)]
 async fn dispatch_server_call(server: PezhaiServer, request: ExternalRequest) -> ExternalResponse {
     match server.call(request.clone()).await {
         Ok(response) => response,
@@ -176,6 +194,67 @@ async fn dispatch_server_call(server: PezhaiServer, request: ExternalRequest) ->
             "server is no longer available",
         ),
     }
+}
+
+async fn dispatch_server_call_with_disconnect(
+    server: PezhaiServer,
+    stream: &TcpStream,
+    request: ExternalRequest,
+) -> Result<Option<ExternalResponse>, Error> {
+    // The transport still processes one request at a time, but while one logical call is in
+    // flight we watch for an EOF via `poll_peek()` so the adapter can best-effort cancel work
+    // that has not crossed a visible or durability-relevant point yet.
+    let cancel_token = request
+        .cancel_token
+        .clone()
+        .expect("effective cancel token should be populated before dispatch");
+    let client_id = request.client_id.clone();
+    let call = server.call(request);
+    tokio::pin!(call);
+
+    tokio::select! {
+        result = &mut call => result.map(Some),
+        peeked = poll_fn(|cx| {
+            let mut probe = [0_u8; 1];
+            let mut read_buf = ReadBuf::new(&mut probe);
+            stream.poll_peek(cx, &mut read_buf)
+        }) => {
+            match peeked {
+                Ok(0) => {
+                    let _ = server.cancel(client_id, cancel_token).await;
+                    Ok(None)
+                }
+                Ok(_) => call.await.map(Some),
+                Err(error) if is_disconnect_error(&error) => {
+                    let _ = server.cancel(client_id, cancel_token).await;
+                    Ok(None)
+                }
+                Err(error) => Err(Error::Io(error)),
+            }
+        }
+    }
+}
+
+fn ensure_effective_cancel_token(request: &mut ExternalRequest) -> String {
+    request
+        .cancel_token
+        .get_or_insert_with(|| {
+            format!(
+                "__tcp_hidden_{}",
+                NEXT_HIDDEN_CANCEL_TOKEN.fetch_add(1, Ordering::Relaxed)
+            )
+        })
+        .clone()
+}
+
+fn is_disconnect_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::UnexpectedEof
+    )
 }
 
 // Drive one connection serially so tests can prove that request admission never pipelines.
@@ -419,6 +498,7 @@ fn invalid_argument_response(
     }
 }
 
+#[cfg(test)]
 fn io_response(
     client_id: String,
     request_id: u64,
@@ -801,7 +881,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let config_id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("adapter-test-{unique}-{config_id}.toml"));
+        let root = std::env::temp_dir().join(format!("adapter-test-{unique}-{config_id}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
         fs::write(
             &path,
             r#"

@@ -133,8 +133,9 @@ mod tests {
             .unwrap()
             .as_nanos();
         let config_id = NEXT_CONFIG_ID.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("pezhai-sevai-main-{unique}-{config_id}.toml"));
+        let root = std::env::temp_dir().join(format!("pezhai-sevai-main-{unique}-{config_id}"));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.toml");
         fs::write(
             &path,
             format!(

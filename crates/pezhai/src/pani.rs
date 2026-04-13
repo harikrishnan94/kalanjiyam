@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
 use crate::idam::StoreLayout;
+use crate::iyakkam::SnapshotHandle;
 use crate::nilaimai::{
     CompactionBuildResult, CompactionPlan, FlushBuildResult, FlushPlan, InternalRecord,
     LogicalMaintenancePlan, LogicalShardEntry, LogicalShardInstallPayload, MemtableRef,
@@ -16,6 +17,33 @@ use crate::pathivu::{
 use crate::sevai::{Bound, ScanRow};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
+
+/// One immutable page-oriented scan task captured from a session-pinned generation.
+#[derive(Clone, Debug)]
+pub(crate) struct ScanPagePlan {
+    pub(crate) scan_id: u64,
+    pub(crate) snapshot_handle: SnapshotHandle,
+    pub(crate) scan_plan: ScanPlan,
+    pub(crate) resume_after_key: Option<Vec<u8>>,
+    pub(crate) max_records_per_page: u32,
+    pub(crate) max_bytes_per_page: u32,
+}
+
+impl ScanPagePlan {
+    /// Returns `true` when this page can be produced from the pinned active memtable alone.
+    #[must_use]
+    pub(crate) fn is_active_only(&self) -> bool {
+        self.scan_plan.is_active_only()
+    }
+}
+
+/// One page result materialized for `ScanFetchNext`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScanPageResult {
+    pub(crate) rows: Vec<ScanRow>,
+    pub(crate) eof: bool,
+    pub(crate) next_resume_after_key: Option<Vec<u8>>,
+}
 
 /// Executes one point-read plan after the active-memtable fast path misses.
 pub(crate) fn execute_point_read(
@@ -64,6 +92,59 @@ pub(crate) fn execute_scan_plan(
     }
 
     Ok(visible_scan_rows(&mut records, plan.snapshot_seqno))
+}
+
+/// Materializes one bounded page from a stable scan plan and resume key.
+pub(crate) fn execute_scan_page_plan(
+    layout: &StoreLayout,
+    plan: &ScanPagePlan,
+) -> Result<ScanPageResult, Error> {
+    let _ = plan.scan_id;
+    let _ = &plan.snapshot_handle;
+    let all_rows = execute_scan_plan(layout, &plan.scan_plan)?;
+    let start_index = match &plan.resume_after_key {
+        Some(resume_after_key) => all_rows.partition_point(|row| row.key <= *resume_after_key),
+        None => 0,
+    };
+    if start_index >= all_rows.len() {
+        return Ok(ScanPageResult {
+            rows: Vec::new(),
+            eof: true,
+            next_resume_after_key: None,
+        });
+    }
+
+    let mut rows = Vec::new();
+    let mut accumulated_bytes = 0usize;
+    for row in all_rows.iter().skip(start_index) {
+        if rows.len() >= plan.max_records_per_page as usize {
+            break;
+        }
+
+        let row_bytes = row.key.len() + row.value.len();
+        if !rows.is_empty() && accumulated_bytes + row_bytes > plan.max_bytes_per_page as usize {
+            break;
+        }
+
+        rows.push(row.clone());
+        if row_bytes > plan.max_bytes_per_page as usize && rows.len() == 1 {
+            break;
+        }
+
+        accumulated_bytes += row_bytes;
+    }
+
+    let consumed_rows = start_index + rows.len();
+    let eof = consumed_rows >= all_rows.len();
+    Ok(ScanPageResult {
+        next_resume_after_key: if eof {
+            None
+        } else {
+            rows.last().map(|row| row.key.clone())
+        },
+        rows,
+        eof,
+    })
 }
 
 /// Builds one temporary shared-data file from the oldest frozen memtable.

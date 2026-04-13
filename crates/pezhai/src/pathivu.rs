@@ -113,20 +113,48 @@ pub(crate) struct WalRecovery {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WalWriterTestOptions {
     pub(crate) fail_at_seqno: Option<u64>,
+    pub(crate) fail_sync_at_seqno: Option<u64>,
 }
 
 /// One append result returned by the WAL writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct AppendOutcome {
     pub(crate) durably_synced: bool,
+    pub(crate) target_seqno: u64,
+    pub(crate) durable_offset_target: u64,
+    pub(crate) wal_segment_id: u64,
+    pub(crate) durable_frontier_covered: bool,
 }
 
-/// Sequential WAL writer owned by the engine worker thread.
-pub(crate) struct WalWriter {
+/// One immutable WAL sync plan for bytes the owner already appended.
+pub(crate) struct WalSyncPlan {
+    file: File,
+    wal_dir: PathBuf,
+    pub(crate) wal_segment_id: u64,
+    pub(crate) durable_offset_target: u64,
+    pub(crate) durable_seqno_target: u64,
+    fail_sync_at_seqno: Option<u64>,
+}
+
+/// One completed durable frontier reached by a sync plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WalSyncResult {
+    pub(crate) wal_segment_id: u64,
+    pub(crate) durable_offset_reached: u64,
+    pub(crate) durable_seqno_target: u64,
+}
+
+/// Owner-owned mutable WAL append state shared by the direct engine and server runtime.
+pub(crate) struct WalAppendState {
     layout: StoreLayout,
     segment_bytes: u64,
     active: Option<ActiveSegment>,
     test_options: WalWriterTestOptions,
+}
+
+/// Sequential WAL writer owned by the engine worker thread.
+pub(crate) struct WalWriter {
+    append_state: WalAppendState,
 }
 
 struct ActiveSegment {
@@ -537,7 +565,62 @@ pub(crate) fn recover_wal(
 }
 
 impl WalWriter {
+    /// Returns mutable access to the lower-level owner-owned append state.
+    pub(crate) fn append_state_mut(&mut self) -> &mut WalAppendState {
+        &mut self.append_state
+    }
+
+    /// Wraps already opened append state for the direct engine worker runtime.
+    #[must_use]
+    pub(crate) fn from_append_state(append_state: WalAppendState) -> Self {
+        Self { append_state }
+    }
+
     /// Opens a sequential WAL writer after recovery.
+    #[cfg(test)]
+    pub(crate) fn open(
+        layout: StoreLayout,
+        segment_bytes: u64,
+        recovered_active: Option<RecoveredActiveSegment>,
+        test_options: WalWriterTestOptions,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            append_state: WalAppendState::open(
+                layout,
+                segment_bytes,
+                recovered_active,
+                test_options,
+            )?,
+        })
+    }
+
+    /// Appends one mutation to the WAL and optionally synchronizes it immediately.
+    #[cfg(test)]
+    pub(crate) fn append_mutation(
+        &mut self,
+        seqno: u64,
+        mutation: &Mutation,
+        sync_mode: SyncMode,
+    ) -> Result<AppendOutcome, Error> {
+        self.append_state
+            .append_mutation(seqno, mutation, sync_mode)
+    }
+
+    /// Synchronizes the current active segment and returns the durable frontier it now covers.
+    pub(crate) fn sync_to_current_frontier(&mut self, target_seqno: u64) -> Result<u64, Error> {
+        let Some(plan) = self.append_state.current_sync_plan(target_seqno)? else {
+            return Ok(target_seqno);
+        };
+        let result = execute_wal_sync_plan(plan)?;
+        Ok(result.durable_seqno_target)
+    }
+
+    /// Shuts down the writer and leaves the active segment available for the next open.
+    pub(crate) fn shutdown(self) {}
+}
+
+impl WalAppendState {
+    /// Opens owner-owned WAL append state after recovery.
     pub(crate) fn open(
         layout: StoreLayout,
         segment_bytes: u64,
@@ -558,17 +641,30 @@ impl WalWriter {
         })
     }
 
-    /// Appends one mutation to the WAL and optionally synchronizes it immediately.
+    /// Appends one mutation and applies the requested sync mode immediately when required.
     pub(crate) fn append_mutation(
         &mut self,
         seqno: u64,
         mutation: &Mutation,
         sync_mode: SyncMode,
     ) -> Result<AppendOutcome, Error> {
-        self.append_record(seqno, WalRecordBody::Mutation(mutation.clone()), sync_mode)
+        self.append_record(
+            seqno,
+            WalRecordBody::Mutation(mutation.clone()),
+            sync_mode == SyncMode::PerWrite,
+        )
     }
 
-    /// Appends one `FlushPublish` record to the WAL.
+    /// Appends one mutation without forcing immediate durability.
+    pub(crate) fn append_mutation_unsynced(
+        &mut self,
+        seqno: u64,
+        mutation: &Mutation,
+    ) -> Result<AppendOutcome, Error> {
+        self.append_record(seqno, WalRecordBody::Mutation(mutation.clone()), false)
+    }
+
+    /// Appends one `FlushPublish` record and applies the requested sync mode immediately when needed.
     pub(crate) fn append_flush_publish(
         &mut self,
         seqno: u64,
@@ -578,11 +674,11 @@ impl WalWriter {
         self.append_record(
             seqno,
             WalRecordBody::FlushPublish(payload.clone()),
-            sync_mode,
+            sync_mode == SyncMode::PerWrite,
         )
     }
 
-    /// Appends one `CompactPublish` record to the WAL.
+    /// Appends one `CompactPublish` record and applies the requested sync mode immediately when needed.
     pub(crate) fn append_compact_publish(
         &mut self,
         seqno: u64,
@@ -592,11 +688,11 @@ impl WalWriter {
         self.append_record(
             seqno,
             WalRecordBody::CompactPublish(payload.clone()),
-            sync_mode,
+            sync_mode == SyncMode::PerWrite,
         )
     }
 
-    /// Appends one `LogicalShardInstall` record to the WAL.
+    /// Appends one `LogicalShardInstall` record and applies the requested sync mode immediately when needed.
     pub(crate) fn append_logical_shard_install(
         &mut self,
         seqno: u64,
@@ -606,32 +702,52 @@ impl WalWriter {
         self.append_record(
             seqno,
             WalRecordBody::LogicalShardInstall(payload.clone()),
-            sync_mode,
+            sync_mode == SyncMode::PerWrite,
         )
     }
 
-    /// Synchronizes the current active segment and returns the durable frontier it now covers.
-    pub(crate) fn sync_to_current_frontier(&mut self, target_seqno: u64) -> Result<u64, Error> {
+    /// Builds one sync plan for the current active frontier.
+    pub(crate) fn current_sync_plan(
+        &self,
+        target_seqno: u64,
+    ) -> Result<Option<WalSyncPlan>, Error> {
         if target_seqno == 0 {
-            return Ok(0);
+            return Ok(None);
         }
-        let Some(active) = self.active.as_mut() else {
-            return Ok(target_seqno);
+        let Some(active) = &self.active else {
+            return Ok(None);
         };
 
-        active.file.sync_all().map_err(Error::Io)?;
-        sync_directory(self.layout.wal_dir())?;
-        Ok(active.last_seqno.unwrap_or(target_seqno))
+        Ok(Some(WalSyncPlan {
+            file: active.file.try_clone().map_err(Error::Io)?,
+            wal_dir: self.layout.wal_dir().to_path_buf(),
+            wal_segment_id: active.first_seqno,
+            durable_offset_target: active.bytes_used,
+            durable_seqno_target: active.last_seqno.unwrap_or(target_seqno),
+            fail_sync_at_seqno: self.test_options.fail_sync_at_seqno,
+        }))
     }
 
-    /// Shuts down the writer and leaves the active segment available for the next open.
-    pub(crate) fn shutdown(self) {}
+    /// Builds one immutable sync plan for the bytes covered by one append outcome.
+    pub(crate) fn sync_plan_for_outcome(
+        &self,
+        outcome: &AppendOutcome,
+    ) -> Result<WalSyncPlan, Error> {
+        Ok(WalSyncPlan {
+            file: self.open_file_for_sync(outcome.wal_segment_id)?,
+            wal_dir: self.layout.wal_dir().to_path_buf(),
+            wal_segment_id: outcome.wal_segment_id,
+            durable_offset_target: outcome.durable_offset_target,
+            durable_seqno_target: outcome.target_seqno,
+            fail_sync_at_seqno: self.test_options.fail_sync_at_seqno,
+        })
+    }
 
     fn append_record(
         &mut self,
         seqno: u64,
         record: WalRecordBody,
-        sync_mode: SyncMode,
+        sync_now: bool,
     ) -> Result<AppendOutcome, Error> {
         let record_bytes = encode_wal_record(seqno, &record)?;
         self.ensure_active_segment(seqno, record_bytes.len() as u64)?;
@@ -652,13 +768,23 @@ impl WalWriter {
         active.last_seqno = Some(seqno);
         active.record_count += 1;
 
-        let durably_synced = sync_mode == SyncMode::PerWrite;
-        if durably_synced {
+        if sync_now {
+            if self.test_options.fail_sync_at_seqno == Some(seqno) {
+                return Err(Error::Io(std::io::Error::other(format!(
+                    "injected WAL sync failure at seqno {seqno}"
+                ))));
+            }
             active.file.sync_all().map_err(Error::Io)?;
             sync_directory(self.layout.wal_dir())?;
         }
 
-        Ok(AppendOutcome { durably_synced })
+        Ok(AppendOutcome {
+            durably_synced: sync_now,
+            target_seqno: seqno,
+            durable_offset_target: active.bytes_used,
+            wal_segment_id: active.first_seqno,
+            durable_frontier_covered: sync_now,
+        })
     }
 
     fn ensure_active_segment(
@@ -711,6 +837,56 @@ impl WalWriter {
         sync_directory(self.layout.wal_dir())?;
         Ok(())
     }
+
+    fn open_file_for_sync(&self, wal_segment_id: u64) -> Result<File, Error> {
+        if let Some(active) = &self.active
+            && active.first_seqno == wal_segment_id
+        {
+            return active.file.try_clone().map_err(Error::Io);
+        }
+
+        for entry in fs::read_dir(self.layout.wal_dir()).map_err(Error::Io)? {
+            let entry = entry.map_err(Error::Io)?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let Some(parsed_name) = parse_wal_file_name(file_name) else {
+                continue;
+            };
+            if parsed_name.first_seqno != wal_segment_id {
+                continue;
+            }
+
+            return OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(entry.path())
+                .map_err(Error::Io);
+        }
+
+        Err(Error::Corruption(format!(
+            "WAL segment {wal_segment_id} was not available for syncing"
+        )))
+    }
+}
+
+/// Executes one immutable WAL sync plan without mutating the append owner.
+pub(crate) fn execute_wal_sync_plan(plan: WalSyncPlan) -> Result<WalSyncResult, Error> {
+    if plan.fail_sync_at_seqno == Some(plan.durable_seqno_target) {
+        return Err(Error::Io(std::io::Error::other(format!(
+            "injected WAL sync failure at seqno {}",
+            plan.durable_seqno_target
+        ))));
+    }
+
+    plan.file.sync_all().map_err(Error::Io)?;
+    sync_directory(&plan.wal_dir)?;
+    Ok(WalSyncResult {
+        wal_segment_id: plan.wal_segment_id,
+        durable_offset_reached: plan.durable_offset_target,
+        durable_seqno_target: plan.durable_seqno_target,
+    })
 }
 
 /// Builds and fsyncs one temporary shared-data file.
@@ -2868,11 +3044,11 @@ mod tests {
     use crate::sevai::Bound;
 
     use super::{
-        AppendOutcome, CurrentFile, ReplaySeed, SyncMode, WalWriter, WalWriterTestOptions,
-        build_current_bytes, build_segment_header, build_temp_data_file,
-        build_temp_metadata_checkpoint_file, crc32c, encode_wal_record, format_active_segment_name,
-        install_metadata_checkpoint, parse_wal_file_name, read_current, read_metadata_checkpoint,
-        recover_wal, truncate_covered_closed_wal_segments,
+        CurrentFile, ReplaySeed, SyncMode, WalWriter, WalWriterTestOptions, build_current_bytes,
+        build_segment_header, build_temp_data_file, build_temp_metadata_checkpoint_file, crc32c,
+        encode_wal_record, format_active_segment_name, install_metadata_checkpoint,
+        parse_wal_file_name, read_current, read_metadata_checkpoint, recover_wal,
+        truncate_covered_closed_wal_segments,
     };
 
     static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
@@ -3232,12 +3408,11 @@ mod tests {
                 SyncMode::Manual,
             )
             .unwrap();
-        assert_eq!(
-            append,
-            AppendOutcome {
-                durably_synced: false
-            }
-        );
+        assert!(!append.durably_synced);
+        assert_eq!(append.target_seqno, 1);
+        assert_eq!(append.wal_segment_id, 1);
+        assert!(!append.durable_frontier_covered);
+        assert!(append.durable_offset_target > 0);
         assert_eq!(writer.sync_to_current_frontier(1).unwrap(), 1);
         writer.shutdown();
 
