@@ -49,51 +49,125 @@ The public lifecycle contract is:
 - `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`, `scan`,
   `sync`, and `stats` are asynchronous
 
-### Current milestone-2 state
+### Current milestone-3 state
 
-Milestone 2 upgrades the direct engine from an in-memory foundation to a
-WAL-backed memtable engine with replay-based recovery.
+Milestone 3 upgrades the direct engine from a WAL-backed memtable engine to one
+shared data plane with retained manifest generations and published `.kjm` data
+files.
 
 The current engine implementation keeps:
 
-- an ordered in-memory map keyed by user key
-- per-key version lists ordered by descending sequence number
-- a snapshot table that pins `snapshot_seqno` plus `data_generation`
-- a background WAL worker that performs sequential segment appends and explicit
-  durability syncs
-- replay logic that reconstructs the active memtable from surviving `Put` and
-  `Delete` records
-- a whole-keyspace logical-shard stats view
+- one current shared-data manifest plus retained historical manifests keyed by
+  `data_generation`
+- one active memtable reference that stays mutable until freeze
+- one ordered frozen-memtable queue, oldest first, with monotonic
+  `frozen_memtable_id`
+- published shared-data files grouped by level
+- one snapshot table that pins `snapshot_seqno` plus `data_generation`
+- one whole-keyspace logical-shard stats view whose `live_size_bytes` value is
+  tracked in owner-local state
 
-`CURRENT` parsing is present now so later checkpoint installs can reuse the
-same durable pointer format, but milestone 2 still rejects non-empty checkpoint
-references because metadata checkpoints are not implemented until later work.
+The retained-manifest rule is:
+
+- writes mutate only the current active memtable object
+- freeze creates the next generation by swapping in a fresh empty active
+  memtable and appending the old active object to the frozen queue
+- flush publish creates the next generation by removing the oldest frozen
+  source and adding one L0 file
+- compaction publish creates the next generation by removing one exact input
+  file set and adding one level-1 output file
+
+Historical manifests are kept in memory for the life of the open engine
+instance so snapshot reads can continue using the exact pinned source set even
+after later freezes, flushes, or compactions are accepted.
 
 ### Boundaries between small admission work and heavier work
 
 The public engine methods are designed around a small critical section over
-owner-local state.
-Milestone 2 uses that critical section only for validation, snapshot handling,
-seqno reservation, and immutable plan capture before handing WAL I/O to the
-background worker.
-
-Later milestones must preserve the same boundary:
+owner-local state. Milestone 3 keeps that boundary:
 
 - validate arguments before doing heavier work
+- resolve snapshot handles and manifest generations before suspension
 - capture immutable read or maintenance plans inside the owner critical section
-- perform blocking or file-backed work only after that section is released
+- perform WAL I/O, data-file reads, scans, flush builds, and compaction builds
+  only after that section is released
 
-### Durable path and checksum foundations
+The resulting split is:
 
-The durable-format foundation is present even before the WAL and data files are
-fully implemented:
+- `put` and `delete` validate input and hand the mutation to the worker thread
+- `get` may answer inline only when the pinned active memtable already contains
+  the visible result; otherwise it captures a point-read plan and runs the
+  blocking file work outside the owner lock
+- `scan` captures one owned scan plan immediately and defers row materialization
+  until `ScanCursor::next()`
 
-- `pathivu.rs` owns `CURRENT`, WAL filenames, segment encoding, replay, and
-  CRC32C validation
-- `idam.rs` owns canonical path derivation for `CURRENT`, `wal/`, `meta/`, and
-  `data/`
-- `pani.rs` still marks the boundary where future maintenance planning will
-  live
+### Worker and publication model
 
-These modules exist now so later durable milestones can extend them without
-changing the public API or the crate layout again.
+The engine still uses one internal worker thread for sequential WAL ownership.
+That worker now performs three distinct responsibilities:
+
+- append `Put` and `Delete` records in seqno order
+- advance the explicit durable frontier for `sync()`
+- perform flush and compaction publication after ordinary writes have installed
+  any needed in-memory freeze
+
+Flush and compaction both follow the same publication boundary:
+
+1. build one temporary output file from immutable captured sources
+2. fsync that temporary file
+3. rename it to the canonical `data/<file_id_20d>.kjm` path
+4. fsync the `data/` directory
+5. append the matching `FlushPublish` or `CompactPublish` WAL record
+6. install the next in-memory manifest generation
+
+If the canonical file exists but the publish record was never accepted, the
+file stays orphaned and the engine keeps it invisible because read routing
+consults only the current or retained manifests.
+
+### Durable file responsibilities
+
+The durable-format modules now have distinct responsibilities:
+
+- `pathivu.rs` owns `CURRENT`, WAL filenames, WAL publish payload encoding,
+  `.kjm` file encode/decode, replay, and CRC32C validation
+- `idam.rs` owns canonical and temporary path derivation for `CURRENT`, `wal/`,
+  `meta/`, and `data/`
+- `pani.rs` owns the execution helpers that turn immutable read and maintenance
+  plans into blocking file work
+
+Milestone 3 keeps the shared-data file format intentionally simple:
+
+- every published data file uses one root data-leaf block stored at block id `1`
+- the file still uses the common `.kjm` header and footer plus the data-leaf
+  slot layout from the spec
+- file validation checks the header, footer, block CRC, internal-key order, and
+  the summary fields mirrored into the WAL payload
+
+### Read routing
+
+Reads route through the pinned manifest generation rather than the latest live
+state.
+
+Point reads probe sources in this order:
+
+1. the pinned active memtable
+2. frozen memtables in descending `frozen_memtable_id`
+3. matching L0 files in descending `file_id`
+4. at most one matching file per higher level
+
+Scans capture the pinned manifest generation, collect overlapping sources, and
+merge internal records by full internal-key order before suppressing shadowed
+versions and tombstones for the pinned `snapshot_seqno`.
+
+### Recovery model
+
+Recovery now rebuilds the current shared-data plane from two sources only:
+
+- the latest accepted manifest publications named by replayed `FlushPublish`
+  and `CompactPublish` records
+- the remaining uncovered `Put` and `Delete` records that become the recovered
+  active memtable
+
+No frozen memtable survives restart. Orphan data files are ignored because
+replay validates and installs only files explicitly named by durable publish
+records.

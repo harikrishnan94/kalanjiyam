@@ -36,12 +36,14 @@ impl StoreLayout {
     }
 
     /// Returns the original config path used during bootstrap.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(crate) fn config_path(&self) -> &Path {
         &self.config_path
     }
 
     /// Returns the store root that owns `CURRENT`, `wal/`, `meta/`, and `data/`.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub(crate) fn store_root(&self) -> &Path {
         &self.store_root
@@ -69,6 +71,22 @@ impl StoreLayout {
     #[must_use]
     pub(crate) fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Returns the canonical shared-data filename for one durable `FileId`.
+    #[must_use]
+    pub(crate) fn data_file_path(&self, file_id: u64) -> PathBuf {
+        self.data_dir.join(format!("{file_id:020}.kjm"))
+    }
+
+    /// Returns one non-canonical temporary shared-data filename.
+    ///
+    /// The temporary filename deliberately does not match the canonical
+    /// `<file_id_20d>.kjm` pattern so crash recovery can keep unpublished files
+    /// orphaned and invisible.
+    #[must_use]
+    pub(crate) fn temp_data_file_path(&self, tag: &str) -> PathBuf {
+        self.data_dir.join(format!(".tmp-{tag}.kjm"))
     }
 }
 
@@ -99,5 +117,19 @@ mod tests {
         assert_eq!(layout.wal_dir(), Path::new("./wal"));
         assert_eq!(layout.meta_dir(), Path::new("./meta"));
         assert_eq!(layout.data_dir(), Path::new("./data"));
+    }
+
+    #[test]
+    fn derives_canonical_and_temporary_data_paths() {
+        let layout = StoreLayout::from_config_path(Path::new("/srv/pezhai/config.toml"));
+
+        assert_eq!(
+            layout.data_file_path(42),
+            Path::new("/srv/pezhai/data/00000000000000000042.kjm")
+        );
+        assert_eq!(
+            layout.temp_data_file_path("flush-12-24"),
+            Path::new("/srv/pezhai/data/.tmp-flush-12-24.kjm")
+        );
     }
 }
