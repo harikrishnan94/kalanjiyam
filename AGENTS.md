@@ -32,10 +32,14 @@
    or making changes.
 3. Base all recommendations and code changes on the current repository
    state plus the latest documentation.
-4. Use subagents for bounded subtasks whenever there is an opportunity
+4. Break every edit task into milestone-based patches that are easy to
+   review, verify, and test.
+5. When a task includes commits, record each verified milestone as its
+   own separate commit.
+6. Use subagents for bounded subtasks whenever there is an opportunity
    to decompose the work safely so the main agent keeps its context
    focused on the critical path.
-5. If documentation, repository state, or user intent conflicts or is
+7. If documentation, repository state, or user intent conflicts or is
    incomplete, pause and ask the user instead of guessing.
 
 ## Plan Mode Clarification Policy
@@ -88,6 +92,9 @@
   main agent had to keep the work local.
 - Every task that edits files must include an independent verification
   run through a fresh subagent that did not produce the edits.
+- Milestone verification must be scoped so each milestone can be
+  reviewed, tested, and committed independently when commits are part of
+  the task.
 - The fresh verification subagent must review the final diff, run or
   inspect the relevant checks, and report completion as two percentage
   scores: a confidence score and an accuracy score, together with any
@@ -341,6 +348,8 @@ kalanjiyam/
 - Wrap all commit message lines at 72 characters or fewer.
 - Use the first line as a single high-level summary.
 - Use the body to describe each changed module or component.
+- When a task includes commits, do not squash multiple milestones into
+  one commit or split one milestone across multiple commits.
 - If multiple components changed, end with an integration note that
   explains how the change fits together.
 - Do not generate overly long subjects or body lines that exceed the
@@ -377,6 +386,9 @@ components)
   that were explained before implementation was proposed or started.
 - State that the staged and unstaged diff was reviewed for documentation
   coverage before finishing.
+- For every edit task, describe the milestone breakdown, explain how
+  each patch was kept easy to review, verify, and test, and map
+  milestones to commits when commits were created.
 - For every edit task, report the fresh verification subagent's
   confidence score and accuracy score, both as percentages, and any
   remaining gaps or risks.
