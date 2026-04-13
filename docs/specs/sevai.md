@@ -347,6 +347,8 @@ Rules:
 - `config_path` MUST be passed to the server process as a command-line argument [BEHAVIORAL]
 - during startup, the owner actor MUST call storage-engine `open(config_path)` before the server is
   considered ready [BEHAVIORAL]
+- the shared config file passed at `config_path` MUST include the `[server_limits]` table defined
+  in `docs/specs/pezhai.md`, and those limits are reopen-only [BEHAVIORAL]
 - in the Rust binding, `start(args)`, `call(request)`, `shutdown()`, and `wait_stopped()` are
   asynchronous control-plane methods; they MUST preserve the lifecycle rules in this section
   without adding synchronous caller-facing start or wait APIs [BEHAVIORAL]
@@ -362,6 +364,19 @@ Rules:
   host indefinitely [BEHAVIORAL]
 - because handle drop cannot await completion, callers that need confirmation MUST still use
   `shutdown()` followed by `wait_stopped()` [BEHAVIORAL]
+
+Config-driven admission limits:
+
+- `server_limits.max_pending_requests` bounds the external request-admission queue
+  [BEHAVIORAL]
+- `server_limits.max_scan_sessions` bounds the number of live paged scan sessions
+  [BEHAVIORAL]
+- `server_limits.max_scan_fetch_queue_per_session` bounds the queued same-scan FIFO depth
+  [BEHAVIORAL]
+- `worker_parallelism`, `max_worker_tasks`, `max_in_flight_scan_tasks`,
+  `max_waiting_durability_waiters`, and `scan_idle_timeout_ms` are part of the normative config
+  contract in v1 even when a milestone has not activated all corresponding worker or durability
+  machinery yet [BEHAVIORAL]
 
 ASCII diagram:
 

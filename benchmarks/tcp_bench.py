@@ -1,4 +1,4 @@
-"""Async TCP benchmark runner for the current in-memory `pezhai-sevai` scaffold."""
+"""Async TCP benchmark runner for the `pezhai-sevai` server."""
 
 from __future__ import annotations
 
@@ -1333,7 +1333,7 @@ def render_server_config(
     port: int,
     server_config: pathlib.Path | None = None,
 ) -> str:
-    """Builds one server config body, either from the default stub or a template TOML file."""
+    """Builds one server config body from defaults or a template TOML file."""
     listen_addr = f"{host}:{port}"
     if server_config is None:
         return (
@@ -1508,9 +1508,7 @@ def parse_args(argv: list[str] | None) -> BenchmarkConfig:
     """Parses and validates the benchmark CLI."""
     parser = argparse.ArgumentParser(
         prog="python -m benchmarks",
-        description=(
-            "Async TCP benchmark for the current in-memory pezhai-sevai scaffold."
-        ),
+        description=("Async TCP benchmark for the pezhai-sevai server."),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(

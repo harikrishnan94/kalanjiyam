@@ -9,9 +9,15 @@ This repository uses the root `kalanjiyam` package as the workspace package owne
 The workspace contains three packages:
 
 - `kalanjiyam`: root package with tiny product-level library helpers
-- `pezhai`: storage engine library and `pezhai::sevai` runtime module
+- `pezhai`: storage engine library with the direct `PezhaiEngine` API and
+  the `pezhai::sevai` runtime module
 - `pezhai-sevai`: server binary package that owns TCP/protobuf transport wiring
   and protobuf code generation from `crates/pezhai-sevai/proto/sevai.proto`
+
+The shared `config.toml` contract now includes `[engine]`, `[wal]`, `[lsm]`,
+`[maintenance]`, `[server_limits]`, and `[sevai]`. The new maintenance and
+server-limit tables are reopen-only and default to the values documented in
+`docs/specs/pezhai.md`.
 
 Use explicit workspace flags when you want a repository-wide Cargo command:
 
@@ -28,8 +34,8 @@ cargo run -p pezhai-sevai -- --config /path/to/config.toml
 
 ## Python Benchmarks
 
-The repository also includes a supported Python benchmark workflow for the current in-memory
-`pezhai-sevai` scaffold under `benchmarks/`.
+The repository also includes a supported Python benchmark workflow for
+`pezhai-sevai` under `benchmarks/`.
 
 Install the benchmark dependency:
 
@@ -53,10 +59,11 @@ python3 -m benchmarks \
   --json-output /tmp/pezhai-bench.json
 ```
 
-Each workload runs against a fresh server process with a fresh temporary config and a fresh
-preload cycle. The runner generates Python protobuf bindings at runtime with local `protoc`.
-To preserve the current scaffold's monotonic per-client ordering rule under load, it isolates
-each logical in-flight lane onto its own TCP connection and `client_id` stream.
+Each workload runs against a fresh server process with a fresh temporary config
+and a fresh preload cycle. The runner generates Python protobuf bindings at
+runtime with local `protoc`. To preserve the server's monotonic per-client
+ordering rule under load, it isolates each logical in-flight lane onto its own
+TCP connection and `client_id` stream.
 
 Use `--mixed-profile balanced` or `--mixed-ratios put=..,delete=..,get=..,scan=..` for the
 `mixed` workload or the wrapper below.
@@ -88,6 +95,7 @@ once per second with current TPS plus `p50`, `p95`, and `p99` latency snapshots.
 The primary storage-engine specification lives in `docs/specs/pezhai.md`.
 The asynchronous server specification lives in `docs/specs/sevai.md`.
 The TCP RPC transport specification lives in `docs/specs/tcp-rpc.md`.
+The engine architecture note lives in `docs/arch/pezhai.md`.
 The workspace package layout lives in `docs/arch/workspace.md`.
 
 ## AI Agent Instructions

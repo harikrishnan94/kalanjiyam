@@ -1,4 +1,4 @@
-//! Transport-agnostic `PezhaiServer` scaffolding for the sevai runtime.
+//! Transport-agnostic `PezhaiServer` runtime for the sevai control plane.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
@@ -10,11 +10,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::config::{RuntimeConfig, load_runtime_config};
 use crate::error::Error;
-
-const MAX_KEY_BYTES: usize = 1024;
-const MAX_PENDING_REQUESTS: usize = 1024;
-const MAX_SCAN_SESSIONS: usize = 128;
-const MAX_FETCH_QUEUE_PER_SCAN: usize = 64;
+use crate::pathivu::{MAX_KEY_BYTES, MAX_VALUE_BYTES};
 
 /// Startup arguments for `PezhaiServer`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,7 +333,7 @@ impl PezhaiServer {
         args: ServerBootstrapArgs,
         options: OwnerRuntimeOptions,
     ) -> Result<Self, Error> {
-        let config = load_runtime_config(&args.config_path).map_err(map_config_error)?;
+        let config = load_runtime_config(&args.config_path).map_err(Error::from)?;
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(SharedServerHandle::new(
             command_tx.clone(),
@@ -510,7 +506,7 @@ enum OwnerCommand {
 
 struct OwnerState {
     _args: ServerBootstrapArgs,
-    _config: RuntimeConfig,
+    config: RuntimeConfig,
     command_tx: mpsc::UnboundedSender<OwnerCommand>,
     options: OwnerRuntimeOptions,
     accepting_requests: bool,
@@ -531,7 +527,7 @@ impl OwnerState {
     ) -> Self {
         Self {
             _args: args,
-            _config: config,
+            config,
             command_tx,
             options,
             accepting_requests: true,
@@ -605,7 +601,8 @@ impl OwnerState {
             return;
         }
 
-        if self.in_flight_request_count() >= MAX_PENDING_REQUESTS {
+        if self.in_flight_request_count() >= self.config.server_limits.max_pending_requests as usize
+        {
             let _ = reply.send(busy_response(
                 request.client_id,
                 request.request_id,
@@ -727,7 +724,7 @@ impl OwnerState {
         request: &ExternalRequest,
         body: &ScanStartRequest,
     ) -> ExternalResponse {
-        if self.scan_sessions.len() >= MAX_SCAN_SESSIONS {
+        if self.scan_sessions.len() >= self.config.server_limits.max_scan_sessions as usize {
             return busy_response(
                 request.client_id.clone(),
                 request.request_id,
@@ -829,7 +826,9 @@ impl OwnerState {
         };
 
         if session.active_fetch.is_some() {
-            if session.queued_fetches.len() >= MAX_FETCH_QUEUE_PER_SCAN {
+            if session.queued_fetches.len()
+                >= self.config.server_limits.max_scan_fetch_queue_per_session as usize
+            {
                 return Some(busy_response(
                     request.client_id.clone(),
                     request.request_id,
@@ -1225,14 +1224,18 @@ fn validate_key(key: &[u8]) -> Result<(), String> {
         return Err("key must not be empty".into());
     }
 
-    if key.len() > MAX_KEY_BYTES {
-        return Err(format!("key exceeds the {MAX_KEY_BYTES}-byte limit"));
-    }
-
-    Ok(())
+    validate_max_length(key.len(), MAX_KEY_BYTES, "key")
 }
 
-fn validate_value(_value: &[u8]) -> Result<(), String> {
+fn validate_value(value: &[u8]) -> Result<(), String> {
+    validate_max_length(value.len(), MAX_VALUE_BYTES, "value")
+}
+
+fn validate_max_length(length: usize, limit: usize, subject: &str) -> Result<(), String> {
+    if length > limit {
+        return Err(format!("{subject} exceeds the {limit}-byte limit"));
+    }
+
     Ok(())
 }
 
@@ -1360,13 +1363,6 @@ fn stopping_status(message: impl Into<String>) -> Status {
         code: StatusCode::Io,
         retryable: true,
         message: Some(message.into()),
-    }
-}
-
-fn map_config_error(error: crate::config::ConfigError) -> Error {
-    match error {
-        crate::config::ConfigError::Io(error) => Error::Io(error),
-        crate::config::ConfigError::Parse(error) => Error::InvalidArgument(error.to_string()),
     }
 }
 
@@ -1679,6 +1675,14 @@ mod tests {
                 }],
             }))
         );
+    }
+
+    #[test]
+    fn length_validation_rejects_values_over_the_shared_limit() {
+        let value_error =
+            super::validate_max_length(super::MAX_VALUE_BYTES + 1, super::MAX_VALUE_BYTES, "value")
+                .unwrap_err();
+        assert!(value_error.contains("value exceeds"));
     }
 
     async fn seed_keys(server: &PezhaiServer) {

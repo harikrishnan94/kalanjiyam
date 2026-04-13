@@ -25,6 +25,9 @@ Run the binary locally:
 cargo run -p pezhai-sevai -- --config /path/to/config.toml
 ```
 
+The shared config schema currently includes `[engine]`, `[wal]`, `[lsm]`,
+`[maintenance]`, `[server_limits]`, and `[sevai]`.
+
 ## Test
 
 Run all unit and integration tests:
@@ -70,7 +73,7 @@ python3 -m benchmarks \
 ```
 
 The runner keeps each logical in-flight lane on its own TCP connection and
-`client_id` stream so the current scaffold's ordering checks remain valid.
+`client_id` stream so the server's ordering checks remain valid.
 
 Use `--mixed-profile balanced` or `--mixed-ratios put=..,delete=..,get=..,scan=..` for
 `mixed`, or run `benchmarks/run-benchmark.sh <bench-config> <server-config>` with one of the

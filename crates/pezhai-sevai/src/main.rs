@@ -1,4 +1,4 @@
-//! Thin Tokio binary for bootstrapping the sevai scaffold.
+//! Thin Tokio binary for bootstrapping the `pezhai::sevai` server.
 
 use std::env;
 use std::future::Future;

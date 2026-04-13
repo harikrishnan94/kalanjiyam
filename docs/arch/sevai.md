@@ -1,197 +1,105 @@
 ## Pezhai Server Architecture
 
-This architecture note describes the runtime layers that back the scaffolded
-`pezhai::sevai::PezhaiServer` handle, the stub in-memory runtime, and the
-binary-owned raw TCP adapter.
+This document is the architecture source of truth for the asynchronous
+`pezhai::sevai` runtime and the `pezhai-sevai` binary package.
 
-The workspace split keeps reusable server code in the `pezhai` library crate
-under the `pezhai::sevai` module. The `pezhai-sevai` package parses
-`--config <path>`, starts the shared runtime, and owns process lifetime wiring
-plus the TCP/protobuf transport binding.
+The server remains transport-agnostic inside the `pezhai` library crate.
+`pezhai-sevai` owns only process bootstrap plus the TCP/protobuf adapter.
 
-### Bootstrapping and Config
+### Package boundaries
 
-The `pezhai-sevai` binary is a thin Tokio program that accepts
-`--config <path>` and passes that path to `pezhai::sevai::PezhaiServer`.
-Config parsing remains library-owned so bootstrap validation stays consistent
-between tests and the executable package. The parser consumes the existing
-`[engine]`, `[wal]`, and `[lsm]` tables verbatim so future integration will be
-compatible, then requires the `[sevai].listen_addr` field. The TCP adapter
-in `pezhai-sevai` binds the `listen_addr` before admitting RPCs, so startup
-fails fast when the address is malformed or already in use.
+- `crates/pezhai/src/sevai.rs` owns the public server handle, owner-actor
+  state, transport-agnostic request and response types, and shutdown
+  coordination.
+- `crates/pezhai-sevai/src/main.rs` owns `--config <path>` bootstrap and
+  process lifetime wiring.
+- `crates/pezhai-sevai/src/adapter.rs` owns the raw TCP listener, framed
+  protobuf decoding and encoding, and the mapping to the transport-agnostic
+  server API.
 
-### Handle and Ownership Boundaries
+### Control-plane model
 
-`PezhaiServer` is a cloneable async handle whose clones share an unbounded async
-channel to a single background owner actor. That channel acts as the owner
-actor's mailbox. The owner actor owns all mutable state, per-client ordering
-information, scan sessions, and the stubbed data map. Clients interact through
-the handle methods `start`, `call`, `cancel`, `shutdown`, and `wait_stopped`,
-ensuring that all effects funnel through one owner and that the boundary
-between handles and the owner actor remains the long-term seam. When the TCP
-adapter owned by `pezhai-sevai` is active, `wait_stopped` also waits for the
-listener task and any live connection handlers to unwind before reporting that
-shutdown is complete.
+The server lifetime is process-scoped rather than RPC-scoped.
 
-The long-term actor services are the owner actor, a worker actor pool for
-immutable blocking jobs, and a dedicated WAL sync actor for durability batches.
-Handles submit work only through the owner actor mailbox, which preserves the
-single serialized publication boundary defined in `docs/specs/sevai.md`.
-The owner actor does not write transport bytes directly; each adapter-owned
-connection handler encodes the response it receives and writes it back to the
-socket after the logical request completes.
+Boot sequence:
 
-### Current Scaffold Runtime Flow
+1. Parse `--config <path>`.
+2. Load and validate the shared `config.toml`.
+3. Start one owner actor.
+4. Bind the TCP adapter to `[sevai].listen_addr`.
+5. Admit external RPCs only after the owner runtime is ready.
 
-The current scaffold keeps ordinary request execution inside the owner actor and
-the adapter-owned connection handlers around it. Tokio may schedule those
-handlers on any runtime worker, so the flow below is task-oriented rather than
-thread-oriented. The owner actor is still the only component that mutates
-shared server state.
+Shutdown sequence:
 
-```text
-transport peer
-    |
-    v
-+---------------------------+
-| TCP connection handler    | ----------------------------------------+
-| - read one frame          |     mpsc::UnboundedSender<OwnerCommand> |
-| - decode RequestEnvelope  |                                         |
-| - call server.call()      |                                         |
-| - await oneshot reply     | <------------------------------------+  |
-| - encode ResponseEnvelope |      oneshot::Sender<ExternalResponse> |  |
-| - write response bytes    |                                      |  |
-+---------------------------+                                      |  |
-    |                                                              |  |
-    v                                                              |  |
-transport peer                                                     |  |
-                                                                   |  |
-                     +---------------------------------------------+  |
-                     |                                                |
-                     v                                                |
-          +-------------------------------+                           |
-          | owner actor                   |                           |
-          | - recv mailbox commands       |                           |
-          | - validate and mutate state   |                           |
-          | - queue and complete scans    |                           |
-          | - release replies in          |                           |
-          |   per-client request order    |                           |
-          +-------------------------------+                           |
-                     ^                                                |
-                     |                                                |
-                     +---- CompleteScanFetch deferred re-entry -------+
-                          from scan-fetch timer task
-```
+1. Stop admitting new requests.
+2. Fail or drain queued waiters according to the server spec.
+3. Stop accepting new TCP work.
+4. Wait for the owner task and registered runtime tasks to unwind.
 
-Shutdown still has two distinct wait points. `shutdown()` sends
-`OwnerCommand::Shutdown` through the owner mailbox. The TCP adapter uses
-`wait_owner_stopped()` to stop accepting new work and unwind live connection
-tasks, while `wait_stopped()` resolves only after the owner completion result is
-available and all registered runtime tasks have finished.
+### Ownership boundaries
 
-### Conceptual Actor Topology
+The owner actor is the only component allowed to mutate shared server state.
+That state currently includes:
 
-The longer-term architecture remains actor-oriented even though the current
-scaffold does not yet route ordinary requests through worker actors or the WAL
-sync actor.
+- request-order tracking keyed by `client_id`
+- scan-session tables and per-scan FIFO fetch queues
+- current stats view published to `Stats`
+- the temporary in-memory key/value state used by the milestone-1 runtime
+
+No transport task mutates shared state directly. The TCP adapter decodes one
+request, submits it through the `PezhaiServer` handle, waits for one logical
+response, then writes one framed reply.
+
+### Config-driven limits
+
+The shared `config.toml` file includes a `[server_limits]` table.
+
+The current server implementation consumes these limits directly:
+
+- `max_pending_requests`
+- `max_scan_sessions`
+- `max_scan_fetch_queue_per_session`
+
+The remaining server-limit fields are part of the stable config contract now
+and are reserved for later worker-pool, durability-waiter, and scan-expiry
+milestones.
+
+### Relationship to the engine core
+
+The storage engine foundation now lives under the `pezhai` crate's internal
+modules:
+
+- `iyakkam`: public engine shell and shared operation-shape helpers
+- `nilaimai`: mutable engine state
+- `pathivu`: WAL and checksum helpers
+- `idam`: durable path layout helpers
+- `pani`: maintenance-planning boundary
+
+Milestone 1 does not yet route normal server requests through the direct
+`PezhaiEngine` shell. The current owner actor still serves requests from its
+own in-memory state while the durable engine modules are established and tested.
+
+That temporary split is intentional:
+
+- the public server API stays stable
+- the new engine API and config surface land without changing the TCP wire
+- later milestones can move request planning into `iyakkam` without replacing
+  the transport adapter or the control-plane lifecycle
+
+### Current execution model
+
+The runtime still uses one owner task plus adapter-owned connection tasks.
 
 ```text
-external handle or transport adapter
-                |
-                v
-      +----------------------+
-      | owner actor          |
-      | - sole publish point |
-      | - owns mutable state |
-      +----------------------+
-         |               ^
-         | owner-issued  | results validated and published
-         v               |
- +------------------+    |
- | worker actor     |----+
- | pool             |
- | - immutable jobs |
- | - read/prepare   |
- +------------------+
-
-         | owner-issued durability batches
-         v
- +------------------+
- | WAL sync actor   |
- | - durability     |
- | - owner-requested|
- | - no publish     |
- +------------------+
+TCP peer
+  -> adapter connection task
+  -> PezhaiServer handle
+  -> owner actor
+  -> logical response
+  -> adapter connection task
+  -> TCP peer
 ```
 
-The first diagram is implementation-accurate for the current scaffold in
-`crates/pezhai/src/sevai.rs` and `crates/pezhai-sevai/src/adapter.rs`. The
-second diagram is conceptual architecture: it describes the intended actor
-decomposition and publication boundary without claiming that the current code
-already routes normal requests through a worker actor pool or a WAL sync actor.
-
-### Logical RPC Model
-
-Logical request and response structs mirror the RPC surface defined in
-`docs/specs/sevai.md`. Requests carry `client_id`, `request_id`, and optional
-`cancel_token`. The owner actor enforces per-client request order, rejects
-duplicates/regressions, queues `ScanFetchNext` operations per scan session, and
-tracks cancellation state for queued work. Responses return the mapped `Status`
-plus method payloads, and `cancel` can mark queued tasks before they run while
-leaving already-complete, non-cancellable requests untouched.
-
-### Stub Runtime Behavior
-
-The owner actor keeps a stable snapshot of the keyspace in an in-memory
-`BTreeMap<Vec<u8>, Vec<u8>>`. Mutations increment `last_committed_seqno`, and
-each response reflects the latest `observation_seqno` and `data_generation`.
-`Get` returns the latest values without spawning workers; `Put`/`Delete` mutate
-the map immediately. `ScanStart` eagerly captures matching rows into a scan
-session structure (range bounds, resume key, page limits, captured snapshot
-metadata, and queued fetch state) and returns a `scan_id`. `ScanFetchNext`
-pages through that captured row set, guaranteeing at least one row per non-EOF
-reply. EOF deletes the session; cancellation removes only the cancelled queued
-request or returns a cancelled response for the active fetch while leaving the
-session available for later fetches. `Stats` reports the owner
-seqno/generation plus stub empty level stats with one logical shard entry
-covering the whole space.
-
-### Current Scaffold Deviations From Spec
-
-The current scaffold is intentionally narrower than `docs/specs/sevai.md`.
-
-- The current request path is a stub owner loop over in-memory state. It does
-  not yet route storage operations through the engine-owned internal operation
-  shell described in the spec.
-- The conceptual worker actor pool and dedicated WAL sync actor are not yet in
-  the live request path. Ordinary `Get`, `ScanFetchNext`, and `Stats` work stay
-  inside the owner actor plus adapter-owned runtime tasks.
-- `ScanStart` captures rows eagerly into the session instead of creating the
-  internal snapshot handle and delegated scan task model described by the spec.
-- Write acknowledgement does not yet model `sync_mode`-driven WAL append,
-  durable-frontier tracking, or dedicated WAL sync batching.
-- Cancelling one `ScanFetchNext` request does not close the whole session in the
-  scaffold. Session deletion happens on EOF or shutdown cleanup, not on
-  per-request cancellation alone.
-
-### TCP Adapter
-
-The TCP adapter lives in the `pezhai-sevai` package and runs inside the same
-Tokio runtime as the owner actor. `pezhai-sevai` owns protobuf generation from
-`crates/pezhai-sevai/proto/sevai.proto` and includes those generated wire types
-for frame decoding and encoding. The adapter listens on the
-`[sevai].listen_addr` endpoint and performs framed exchanges: each loop
-iteration reads 4 big-endian bytes, then that many protobuf payload bytes,
-decodes a `RequestEnvelope`, maps it to a logical request, and dispatches the
-work through the shared server handle. Each connection handler processes one
-request/response cycle at a time and does not read the next frame until it has
-written the current response back to the socket. During shutdown, the adapter
-stops accepting new connections, lets live handlers finish the request they are
-already processing, and prevents those handlers from reading any further work
-before `wait_stopped` observes full shutdown completion.
-Errors from malformed frames or bytes are returned as transport-level failures
-before reaching the logical layer.
-
-This layered architecture keeps the transport adapter thin, preserves the
-single owner-actor boundary, and records the scaffolded in-memory behavior that
-future realistic storage engines will replace.
+For milestone 1, request execution remains owner-local and in-memory.
+Background worker pools, WAL sync batching, delegated file reads, and durable
+maintenance publication are planned next but are not active yet.

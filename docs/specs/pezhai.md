@@ -68,8 +68,12 @@ Success means:
 
 - the public operations `open`, `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`,
   `scan`, `sync`, and `stats` have fully specified externally visible behavior [BEHAVIORAL]
-- language bindings MAY expose those operations through asynchronous handles, but awaiting them
-  MUST preserve the same behavior defined here for the named operations [BEHAVIORAL]
+- the Rust binding exported by this repository names the direct engine handle `PezhaiEngine`,
+  the snapshot token `SnapshotHandle`, the scan range `ScanRange`, and the owned scan cursor
+  `ScanCursor` [BEHAVIORAL]
+- the Rust binding MUST expose `open(config_path)` and `close(self)` synchronously, while
+  `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`, `scan`, `sync`, and `stats`
+  remain asynchronous [BEHAVIORAL]
 - implementations MAY route those operations through one shared engine-owned internal dispatcher
   that returns an immediate result, one durability wait, or one immutable read plan, as long as
   the externally visible behavior of the named operations remains exactly the same [BEHAVIORAL]
@@ -444,6 +448,26 @@ base_level_bytes = 268435456
 level_fanout = 10
 l0_file_threshold = 8
 max_levels = 7
+
+[maintenance]
+checkpoint_after_wal_bytes = 1073741824
+logical_split_bytes = 536870912
+logical_merge_bytes = 134217728
+max_concurrent_flushes = 1
+max_concurrent_compactions = 1
+
+[server_limits]
+worker_parallelism = 8
+max_pending_requests = 1024
+max_worker_tasks = 256
+max_scan_sessions = 128
+max_in_flight_scan_tasks = 64
+max_scan_fetch_queue_per_session = 64
+max_waiting_durability_waiters = 1024
+scan_idle_timeout_ms = 300000
+
+[sevai]
+listen_addr = "127.0.0.1:9000"
 ```
 
 If `config.toml` is not valid TOML or violates the schema and validation rules in this section,
@@ -477,6 +501,36 @@ If `config.toml` is not valid TOML or violates the schema and validation rules i
   type `u32`; default `8`; mutability reopen-only; validation `>= 2` [PERF]
 - `lsm.max_levels`:
   type `u32`; default `7`; mutability reopen-only; validation `4..16` [PERF]
+- `maintenance.checkpoint_after_wal_bytes`:
+  type `u64`; default `wal.segment_bytes`; mutability reopen-only; validation `> 0`
+  [BEHAVIORAL]
+- `maintenance.logical_split_bytes`:
+  type `u64`; default `2 * lsm.base_level_bytes`; mutability reopen-only; validation `> 0`
+  [BEHAVIORAL]
+- `maintenance.logical_merge_bytes`:
+  type `u64`; default `lsm.base_level_bytes / 2`; mutability reopen-only; validation `> 0`
+  and `< maintenance.logical_split_bytes` [BEHAVIORAL]
+- `maintenance.max_concurrent_flushes`:
+  type `u32`; default `1`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `maintenance.max_concurrent_compactions`:
+  type `u32`; default `1`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.worker_parallelism`:
+  type `u32`; default `available_parallelism()`; mutability reopen-only; validation `>= 1`
+  [BEHAVIORAL]
+- `server_limits.max_pending_requests`:
+  type `u32`; default `1024`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.max_worker_tasks`:
+  type `u32`; default `256`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.max_scan_sessions`:
+  type `u32`; default `128`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.max_in_flight_scan_tasks`:
+  type `u32`; default `64`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.max_scan_fetch_queue_per_session`:
+  type `u32`; default `64`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.max_waiting_durability_waiters`:
+  type `u32`; default `1024`; mutability reopen-only; validation `>= 1` [BEHAVIORAL]
+- `server_limits.scan_idle_timeout_ms`:
+  type `u64`; default `300000`; mutability reopen-only; validation `> 0` [BEHAVIORAL]
 
 Implementation constants:
 
@@ -2199,12 +2253,47 @@ function validate_metadata_list_block(block_bytes):
 
 ## 9. External Operations
 
+### 9.0 Rust binding and admission-path rules
+
+The Rust binding exported by this repository uses these public names:
+
+- `PezhaiEngine`
+- `SnapshotHandle`
+- `Bound`
+- `ScanRange`
+- `ScanCursor`
+- `ScanRow`
+- `GetResponse`
+- `SyncResponse`
+- `StatsResponse`
+- `LevelStats`
+- `LogicalShardStats`
+- `Error`
+
+Rules:
+
+- `PezhaiEngine::open(config_path)` and `close(self)` MUST be synchronous
+  [BEHAVIORAL]
+- `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`, `scan`, `sync`, and `stats`
+  MUST be asynchronous in the Rust binding [BEHAVIORAL]
+- no public API may expose `Mutex`, `RwLock`, or guard types, and no caller-managed lock may be
+  required for correctness [BEHAVIORAL]
+- before the first await or delegated execution, public methods MAY validate arguments, resolve
+  snapshots, update owner-local indexes, register waiters, allocate ids, and capture immutable
+  plans [BEHAVIORAL]
+- before the first await or delegated execution, public methods MUST NOT perform disk I/O,
+  network I/O, file-backed iterator merges, fsync, flush, compaction, checkpoint work, exact
+  logical-shard byte recomputation, or other blocking durable work [BEHAVIORAL]
+- `get()` MAY complete inline only for active-memtable hits, `ScanCursor::next()` MAY complete
+  inline only for active-memtable-only page production, and `stats()` MUST remain owner-state-only
+  [BEHAVIORAL]
+
 ### 9.1 `open(config_path)` (`FR-OPEN`)
 
 Language-binding note:
 
-- the Rust binding MAY expose `open(config_path)` as one asynchronous handle-construction step, but
-  completion MUST mean the same recovered engine state described below [BEHAVIORAL]
+- the Rust binding for this repository MUST expose `open(config_path)` synchronously, and a
+  successful return MUST mean the same recovered engine state described below [BEHAVIORAL]
 
 Why it exists:
 
