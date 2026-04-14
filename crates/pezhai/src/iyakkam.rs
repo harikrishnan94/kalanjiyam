@@ -20,17 +20,16 @@ use crate::nilaimai::{
 };
 use crate::pani::{
     ScanPagePlan, build_compaction_output, build_flush_output, execute_gc,
-    execute_logical_maintenance_plan, execute_point_read, execute_scan_plan,
+    execute_logical_maintenance_plan, execute_point_read, execute_scan_page_plan,
+    execute_scan_plan,
 };
 use crate::pathivu::{
     AppendOutcome, CurrentFile, MAX_KEY_BYTES, MAX_VALUE_BYTES, ReplaySeed, WalAppendState,
-    WalRecovery, WalWriter, WalWriterTestOptions, build_temp_metadata_checkpoint_file,
-    install_current, install_metadata_checkpoint, list_canonical_data_file_ids, read_current,
-    read_metadata_checkpoint, recover_wal, retained_wal_bytes_after,
-    truncate_covered_closed_wal_segments,
+    WalRecovery, WalSyncPlan, WalWriter, WalWriterTestOptions, build_temp_metadata_checkpoint_file,
+    execute_wal_sync_plan, install_current, install_metadata_checkpoint,
+    list_canonical_data_file_ids, read_current, read_metadata_checkpoint, recover_wal,
+    retained_wal_bytes_after, truncate_covered_closed_wal_segments,
 };
-
-use crate::sevai::{Bound, GetResponse, ScanRow, StatsResponse};
 
 static NEXT_ENGINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -55,6 +54,284 @@ impl SnapshotHandle {
     #[must_use]
     pub fn data_generation(&self) -> u64 {
         self.data_generation
+    }
+}
+
+/// Inclusive or infinite bound shared by engine scans and server-visible range APIs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bound {
+    NegInf,
+    Finite(Vec<u8>),
+    PosInf,
+}
+
+/// One row returned by engine scans or paged server reads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanRow {
+    /// Row key bytes.
+    pub key: Vec<u8>,
+    /// Row value bytes.
+    pub value: Vec<u8>,
+}
+
+/// One successful point-read result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetResponse {
+    /// Whether a value was present.
+    pub found: bool,
+    /// Current value when `found` is true.
+    pub value: Option<Vec<u8>>,
+    /// Latest committed seqno observed at admission time.
+    pub observation_seqno: u64,
+    /// Latest data generation observed at admission time.
+    pub data_generation: u64,
+}
+
+/// One level-wise stats entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LevelStats {
+    /// Level number within the storage hierarchy.
+    pub level_no: u32,
+    /// Number of files in the level.
+    pub file_count: u64,
+    /// Logical bytes represented by the level.
+    pub logical_bytes: u64,
+    /// Physical bytes consumed by the level.
+    pub physical_bytes: u64,
+}
+
+/// One logical-shard stats entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalShardStats {
+    /// Inclusive lower bound for the shard.
+    pub start_bound: Bound,
+    /// Exclusive upper bound for the shard.
+    pub end_bound: Bound,
+    /// Latest measured live logical bytes for the shard.
+    pub live_size_bytes: u64,
+}
+
+/// One stats snapshot collected from the current engine state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StatsResponse {
+    /// Latest committed seqno observed by this view.
+    pub observation_seqno: u64,
+    /// Latest data generation observed by this view.
+    pub data_generation: u64,
+    /// Current level-wise shared-data stats.
+    pub levels: Vec<LevelStats>,
+    /// Current logical-shard stats.
+    pub logical_shards: Vec<LogicalShardStats>,
+}
+
+/// Page-size limits used by paged engine scans and the server scan API.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScanPageLimits {
+    /// Maximum number of rows to return in one page.
+    pub max_records_per_page: u32,
+    /// Maximum logical bytes to target in one page.
+    pub max_bytes_per_page: u32,
+}
+
+/// One completed paged-scan response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanPageResponse {
+    /// Rows returned for this page.
+    pub rows: Vec<ScanRow>,
+    /// Whether this page reached the end of the pinned snapshot.
+    pub eof: bool,
+}
+
+/// One prepared write that either needs no further work or must wait for durability.
+#[derive(Debug)]
+pub enum WriteDecision {
+    Ready,
+    DurabilityWait(DurabilityWait),
+}
+
+/// One prepared point read that either finished inline or needs deferred file work.
+#[derive(Debug)]
+pub enum GetDecision {
+    Ready(GetResponse),
+    Deferred(DeferredGet),
+}
+
+/// One prepared scan page that either finished inline or needs deferred file work.
+#[derive(Debug)]
+pub enum ScanPageDecision {
+    Ready(ScanPageResponse),
+    Deferred(Box<DeferredScanPage>),
+}
+
+/// One waiter for a specific durable frontier target.
+pub struct DurabilityWait {
+    core: Arc<EngineCore>,
+    command_tx: mpsc::Sender<WalCommand>,
+    sync_plan: WalSyncPlan,
+    target_seqno: u64,
+}
+
+impl std::fmt::Debug for DurabilityWait {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DurabilityWait")
+            .field("target_seqno", &self.target_seqno)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DurabilityWait {
+    /// Returns the sequence number this waiter must durably cover.
+    #[must_use]
+    pub fn target_seqno(&self) -> u64 {
+        self.target_seqno
+    }
+
+    /// Waits until the engine's durable frontier covers `target_seqno`.
+    pub async fn wait(self) -> Result<(), Error> {
+        let sync_result = match task::spawn_blocking(move || execute_wal_sync_plan(self.sync_plan))
+            .await
+            .map_err(spawn_blocking_error)?
+        {
+            Ok(sync_result) => sync_result,
+            Err(error) => {
+                if let Ok(mut state) = self.core.lock_state() {
+                    state.mark_write_failed(error.to_string());
+                }
+                return Err(error);
+            }
+        };
+        {
+            let mut state = self.core.lock_state()?;
+            state.mark_synced(sync_result.durable_seqno_target);
+        }
+        let _ = self.command_tx.send(WalCommand::MaintenanceTick);
+        Ok(())
+    }
+}
+
+/// One deferred point read over immutable sources beyond the active-memtable fast path.
+#[derive(Debug)]
+pub struct DeferredGet {
+    layout: StoreLayout,
+    snapshot: ResolvedSnapshot,
+    plan: PointReadPlan,
+}
+
+impl DeferredGet {
+    /// Executes one deferred point read and materializes the final public response.
+    pub async fn execute(self) -> Result<GetResponse, Error> {
+        let value = task::spawn_blocking(move || execute_point_read(&self.layout, &self.plan))
+            .await
+            .map_err(spawn_blocking_error)??;
+
+        Ok(GetResponse {
+            found: value.is_some(),
+            value,
+            observation_seqno: self.snapshot.snapshot_seqno,
+            data_generation: self.snapshot.data_generation,
+        })
+    }
+}
+
+/// One snapshot-pinned paged scan over the current engine state.
+#[must_use = "paged scans pin a snapshot until EOF or drop"]
+pub struct PagedScan {
+    state: Arc<Mutex<PagedScanState>>,
+}
+
+impl PagedScan {
+    /// Returns the sequence number pinned for this paged scan.
+    #[must_use]
+    pub fn observation_seqno(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("paged scan mutex poisoned")
+            .snapshot_handle
+            .snapshot_seqno()
+    }
+
+    /// Returns the data generation pinned for this paged scan.
+    #[must_use]
+    pub fn data_generation(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("paged scan mutex poisoned")
+            .snapshot_handle
+            .data_generation()
+    }
+
+    /// Prepares the next page for this scan, possibly completing inline.
+    pub fn prepare_next_page(&mut self) -> Result<ScanPageDecision, Error> {
+        let (layout, page_plan) = {
+            let state = self.state.lock().expect("paged scan mutex poisoned");
+            if state.eof {
+                return Ok(ScanPageDecision::Ready(ScanPageResponse {
+                    rows: Vec::new(),
+                    eof: true,
+                }));
+            }
+
+            let engine_state = state.core.lock_state()?;
+            let page_plan = capture_scan_page_request(
+                &engine_state,
+                0,
+                &state.snapshot_handle,
+                state.range.start_bound(),
+                state.range.end_bound(),
+                state.resume_after_key.clone(),
+                state.page_limits.max_records_per_page,
+                state.page_limits.max_bytes_per_page,
+            )?;
+            (state.layout.clone(), page_plan)
+        };
+
+        if page_plan.is_active_only() {
+            let response = {
+                let page = execute_scan_page_plan(&layout, &page_plan)?;
+                let mut state = self.state.lock().expect("paged scan mutex poisoned");
+                state.apply_page(page)?
+            };
+            return Ok(ScanPageDecision::Ready(response));
+        }
+
+        Ok(ScanPageDecision::Deferred(
+            DeferredScanPage {
+                state: Arc::clone(&self.state),
+                layout,
+                page_plan,
+            }
+            .into(),
+        ))
+    }
+}
+
+/// One deferred paged-scan execution over immutable sources.
+pub struct DeferredScanPage {
+    state: Arc<Mutex<PagedScanState>>,
+    layout: StoreLayout,
+    page_plan: ScanPagePlan,
+}
+
+impl std::fmt::Debug for DeferredScanPage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeferredScanPage")
+            .field("layout", &self.layout)
+            .field("page_plan", &self.page_plan)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeferredScanPage {
+    /// Executes one deferred page fetch and advances the paged-scan state on success.
+    pub async fn execute(self) -> Result<ScanPageResponse, Error> {
+        let page =
+            task::spawn_blocking(move || execute_scan_page_plan(&self.layout, &self.page_plan))
+                .await
+                .map_err(spawn_blocking_error)??;
+        let mut state = self.state.lock().expect("paged scan mutex poisoned");
+        state.apply_page(page)
     }
 }
 
@@ -257,6 +534,47 @@ impl PezhaiEngine {
         release_snapshot_handle(&mut state, &handle)
     }
 
+    /// Appends one `Put` mutation and returns the next engine-owned action required for it.
+    ///
+    /// In `manual` mode the write is ready immediately after WAL append and in-memory install.
+    /// In `per_write` mode the returned waiter must be awaited before acknowledging success.
+    pub fn prepare_put(&self, key: &[u8], value: &[u8]) -> Result<WriteDecision, Error> {
+        validate_key(key)?;
+        validate_value(value)?;
+        self.prepare_mutation(Mutation::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        })
+    }
+
+    /// Appends one `Delete` mutation and returns the next engine-owned action required for it.
+    ///
+    /// In `manual` mode the write is ready immediately after WAL append and in-memory install.
+    /// In `per_write` mode the returned waiter must be awaited before acknowledging success.
+    pub fn prepare_delete(&self, key: &[u8]) -> Result<WriteDecision, Error> {
+        validate_key(key)?;
+        self.prepare_mutation(Mutation::Delete { key: key.to_vec() })
+    }
+
+    /// Captures one latest-view point read using the public deferred-read API.
+    ///
+    /// Returns `Ready` for active-memtable hits and `Deferred` when immutable-source file work is
+    /// still required.
+    pub fn prepare_latest_get(&self, key: &[u8]) -> Result<GetDecision, Error> {
+        self.prepare_get(key, None)
+    }
+
+    /// Creates one paged latest-view scan pinned to the current committed frontier.
+    ///
+    /// Returns `InvalidArgument` when the range or page limits are invalid.
+    pub fn start_paged_scan(
+        &self,
+        range: ScanRange,
+        page_limits: ScanPageLimits,
+    ) -> Result<PagedScan, Error> {
+        self.start_paged_scan_internal(range, page_limits, None)
+    }
+
     /// Inserts or replaces one key/value pair.
     ///
     /// Returns `InvalidArgument` when the key or value exceeds the documented limits.
@@ -308,34 +626,10 @@ impl PezhaiEngine {
         key: &[u8],
         snapshot: Option<&SnapshotHandle>,
     ) -> Result<GetResponse, Error> {
-        validate_key(key)?;
-        let (snapshot, plan) = {
-            let state = self.core.lock_state()?;
-            let snapshot = resolve_snapshot_for_read(&state, snapshot)?;
-            match capture_get_request(&state, key, snapshot)? {
-                CapturedGet::Inline(active_result) => {
-                    return Ok(GetResponse {
-                        found: active_result.is_some(),
-                        value: active_result,
-                        observation_seqno: snapshot.snapshot_seqno,
-                        data_generation: snapshot.data_generation,
-                    });
-                }
-                CapturedGet::Deferred(plan) => (snapshot, plan),
-            }
-        };
-
-        let layout = self.core.layout.clone();
-        let value = task::spawn_blocking(move || execute_point_read(&layout, &plan))
-            .await
-            .map_err(spawn_blocking_error)??;
-
-        Ok(GetResponse {
-            found: value.is_some(),
-            value,
-            observation_seqno: snapshot.snapshot_seqno,
-            data_generation: snapshot.data_generation,
-        })
+        match self.prepare_get(key, snapshot)? {
+            GetDecision::Ready(response) => Ok(response),
+            GetDecision::Deferred(get) => get.execute().await,
+        }
     }
 
     /// Creates one owned forward scan cursor for either the latest view or one explicit snapshot.
@@ -346,20 +640,8 @@ impl PezhaiEngine {
         range: ScanRange,
         snapshot: Option<&SnapshotHandle>,
     ) -> Result<ScanCursor, Error> {
-        let (snapshot_seqno, data_generation, plan) = {
-            let state = self.core.lock_state()?;
-            let (snapshot_seqno, data_generation) = resolve_snapshot(&state, snapshot)?;
-            (
-                snapshot_seqno,
-                data_generation,
-                state.plan_scan(
-                    range.start_bound(),
-                    range.end_bound(),
-                    snapshot_seqno,
-                    data_generation,
-                )?,
-            )
-        };
+        let (snapshot_seqno, data_generation, plan) =
+            self.capture_scan_cursor_plan(range, snapshot)?;
 
         Ok(ScanCursor {
             observation_seqno: snapshot_seqno,
@@ -386,26 +668,50 @@ impl PezhaiEngine {
             target_seqno
         };
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.wal_runtime
+        let Some(sync_plan) = self.prepare_sync_plan(target_seqno)? else {
+            let state = self.core.lock_state()?;
+            return Ok(SyncResponse {
+                durable_seqno: state.durable_seqno.max(target_seqno),
+            });
+        };
+        let sync_result = match task::spawn_blocking(move || execute_wal_sync_plan(sync_plan))
+            .await
+            .map_err(spawn_blocking_error)?
+        {
+            Ok(sync_result) => sync_result,
+            Err(error) => {
+                let mut state = self.core.lock_state()?;
+                state.mark_write_failed(error.to_string());
+                return Err(error);
+            }
+        };
+        {
+            let mut state = self.core.lock_state()?;
+            state.mark_synced(sync_result.durable_seqno_target);
+        }
+        let _ = self
+            .wal_runtime
             .command_tx
-            .send(WalCommand::Sync {
-                target_seqno,
-                reply: reply_tx,
-            })
-            .map_err(wal_worker_send_error)?;
-
-        let durable_seqno = reply_rx.await.map_err(wal_worker_reply_error)??;
+            .send(WalCommand::MaintenanceTick);
+        let durable_seqno = sync_result.durable_seqno_target;
         Ok(SyncResponse { durable_seqno })
     }
 
     /// Returns the current engine stats view without performing external I/O.
     pub async fn stats(&self) -> Result<StatsResponse, Error> {
+        self.current_stats()
+    }
+
+    /// Returns the current engine stats view without performing external I/O.
+    pub fn current_stats(&self) -> Result<StatsResponse, Error> {
         let state = self.core.lock_state()?;
         Ok(collect_stats_response(&state))
     }
 
-    fn open_with_options(config_path: &Path, options: EngineTestOptions) -> Result<Self, Error> {
+    pub(crate) fn open_with_options(
+        config_path: &Path,
+        options: EngineTestOptions,
+    ) -> Result<Self, Error> {
         let config = load_runtime_config(config_path).map_err(Error::from)?;
         let opened = open_engine_runtime(config_path, config.clone(), options)?;
         let core = Arc::new(EngineCore {
@@ -427,6 +733,130 @@ impl PezhaiEngine {
                 join_handle: Some(join_handle),
             },
         })
+    }
+
+    fn prepare_mutation(&self, mutation: Mutation) -> Result<WriteDecision, Error> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.wal_runtime
+            .command_tx
+            .send(WalCommand::PrepareMutation {
+                mutation,
+                reply: reply_tx,
+            })
+            .map_err(wal_worker_send_error)?;
+        let prepared = reply_rx.recv().map_err(wal_worker_recv_error)??;
+        if let Some(sync_plan) = prepared.sync_plan {
+            return Ok(WriteDecision::DurabilityWait(DurabilityWait {
+                core: Arc::clone(&self.core),
+                command_tx: self.wal_runtime.command_tx.clone(),
+                sync_plan,
+                target_seqno: prepared.target_seqno,
+            }));
+        }
+        Ok(WriteDecision::Ready)
+    }
+
+    fn prepare_get(
+        &self,
+        key: &[u8],
+        snapshot: Option<&SnapshotHandle>,
+    ) -> Result<GetDecision, Error> {
+        validate_key(key)?;
+        let (snapshot, plan) = {
+            let state = self.core.lock_state()?;
+            let snapshot = resolve_snapshot_for_read(&state, snapshot)?;
+            match capture_get_request(&state, key, snapshot)? {
+                CapturedGet::Inline(active_result) => {
+                    return Ok(GetDecision::Ready(GetResponse {
+                        found: active_result.is_some(),
+                        value: active_result,
+                        observation_seqno: snapshot.snapshot_seqno,
+                        data_generation: snapshot.data_generation,
+                    }));
+                }
+                CapturedGet::Deferred(plan) => (snapshot, plan),
+            }
+        };
+
+        Ok(GetDecision::Deferred(DeferredGet {
+            layout: self.core.layout.clone(),
+            snapshot,
+            plan,
+        }))
+    }
+
+    fn start_paged_scan_internal(
+        &self,
+        range: ScanRange,
+        page_limits: ScanPageLimits,
+        snapshot: Option<&SnapshotHandle>,
+    ) -> Result<PagedScan, Error> {
+        if page_limits.max_records_per_page == 0 {
+            return Err(Error::InvalidArgument(
+                "max_records_per_page must be greater than zero".into(),
+            ));
+        }
+        if page_limits.max_bytes_per_page == 0 {
+            return Err(Error::InvalidArgument(
+                "max_bytes_per_page must be greater than zero".into(),
+            ));
+        }
+
+        let snapshot_handle = {
+            let mut state = self.core.lock_state()?;
+            match snapshot {
+                Some(handle) => {
+                    let _ = resolve_snapshot(&state, Some(handle))?;
+                    handle.clone()
+                }
+                None => create_snapshot_handle(&mut state),
+            }
+        };
+
+        Ok(PagedScan {
+            state: Arc::new(Mutex::new(PagedScanState {
+                core: Arc::clone(&self.core),
+                layout: self.core.layout.clone(),
+                snapshot_handle,
+                range,
+                page_limits,
+                resume_after_key: None,
+                eof: false,
+                released: false,
+                owns_snapshot: snapshot.is_none(),
+            })),
+        })
+    }
+
+    fn capture_scan_cursor_plan(
+        &self,
+        range: ScanRange,
+        snapshot: Option<&SnapshotHandle>,
+    ) -> Result<(u64, u64, crate::nilaimai::ScanPlan), Error> {
+        let state = self.core.lock_state()?;
+        let (snapshot_seqno, data_generation) = resolve_snapshot(&state, snapshot)?;
+        Ok((
+            snapshot_seqno,
+            data_generation,
+            state.plan_scan(
+                range.start_bound(),
+                range.end_bound(),
+                snapshot_seqno,
+                data_generation,
+            )?,
+        ))
+    }
+
+    fn prepare_sync_plan(&self, target_seqno: u64) -> Result<Option<WalSyncPlan>, Error> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        self.wal_runtime
+            .command_tx
+            .send(WalCommand::PrepareSyncPlan {
+                target_seqno,
+                reply: reply_tx,
+            })
+            .map_err(wal_worker_send_error)?;
+        reply_rx.recv().map_err(wal_worker_recv_error)?
     }
 
     fn shutdown_worker(&mut self) -> Result<(), Error> {
@@ -464,9 +894,63 @@ impl EngineCore {
     }
 }
 
+struct PagedScanState {
+    core: Arc<EngineCore>,
+    layout: StoreLayout,
+    snapshot_handle: SnapshotHandle,
+    range: ScanRange,
+    page_limits: ScanPageLimits,
+    resume_after_key: Option<Vec<u8>>,
+    eof: bool,
+    released: bool,
+    owns_snapshot: bool,
+}
+
+impl PagedScanState {
+    // The paged API advances resume state only after one page finishes so callers can preserve
+    // server-side cancellation and FIFO rules around the deferred execution step.
+    fn apply_page(&mut self, page: crate::pani::ScanPageResult) -> Result<ScanPageResponse, Error> {
+        if page.eof {
+            self.eof = true;
+            self.resume_after_key = None;
+            self.release_snapshot()?;
+        } else {
+            self.resume_after_key = page.next_resume_after_key;
+        }
+
+        Ok(ScanPageResponse {
+            rows: page.rows,
+            eof: page.eof,
+        })
+    }
+
+    fn release_snapshot(&mut self) -> Result<(), Error> {
+        if self.released || !self.owns_snapshot {
+            self.released = true;
+            return Ok(());
+        }
+
+        let mut state = self.core.lock_state()?;
+        release_snapshot_handle(&mut state, &self.snapshot_handle)?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for PagedScanState {
+    fn drop(&mut self) {
+        let _ = self.release_snapshot();
+    }
+}
+
 struct WalRuntime {
     command_tx: mpsc::Sender<WalCommand>,
     join_handle: Option<JoinHandle<()>>,
+}
+
+struct PreparedWrite {
+    target_seqno: u64,
+    sync_plan: Option<WalSyncPlan>,
 }
 
 enum WalCommand {
@@ -474,10 +958,15 @@ enum WalCommand {
         mutation: Mutation,
         reply: oneshot::Sender<Result<(), Error>>,
     },
-    Sync {
-        target_seqno: u64,
-        reply: oneshot::Sender<Result<u64, Error>>,
+    PrepareMutation {
+        mutation: Mutation,
+        reply: mpsc::Sender<Result<PreparedWrite, Error>>,
     },
+    PrepareSyncPlan {
+        target_seqno: u64,
+        reply: mpsc::Sender<Result<Option<WalSyncPlan>, Error>>,
+    },
+    MaintenanceTick,
     Shutdown,
 }
 
@@ -512,26 +1001,48 @@ fn wal_worker_loop(
                 }
                 let _ = reply.send(result);
             }
-            WalCommand::Sync {
+            WalCommand::PrepareMutation { mutation, reply } => {
+                let result = match core.lock_state() {
+                    Ok(mut state) => {
+                        let sync_mode = state.sync_mode();
+                        append_live_mutation_unsynced(
+                            &mut state,
+                            writer.append_state_mut(),
+                            &mutation,
+                        )
+                        .and_then(|outcome| {
+                            let sync_plan = if sync_mode == SyncMode::PerWrite
+                                && !outcome.durable_frontier_covered
+                            {
+                                Some(writer.append_state_mut().sync_plan_for_outcome(&outcome)?)
+                            } else {
+                                None
+                            };
+                            Ok(PreparedWrite {
+                                target_seqno: outcome.target_seqno,
+                                sync_plan,
+                            })
+                        })
+                    }
+                    Err(error) => Err(error),
+                };
+                let _ = reply.send(result);
+            }
+            WalCommand::PrepareSyncPlan {
                 target_seqno,
                 reply,
             } => {
-                let result = match writer.sync_to_current_frontier(target_seqno) {
-                    Ok(durable_seqno) => match core.lock_state() {
-                        Ok(mut state) => {
-                            state.mark_synced(durable_seqno);
-                            Ok(durable_seqno)
-                        }
+                let result = match core.lock_state() {
+                    Ok(state) if state.durable_seqno >= target_seqno => Ok(None),
+                    Ok(_) => match writer.append_state_mut().current_sync_plan(target_seqno) {
+                        Ok(plan) => Ok(plan),
                         Err(error) => Err(error),
                     },
-                    Err(error) => {
-                        if let Ok(mut state) = core.lock_state() {
-                            state.mark_write_failed(error.to_string());
-                        }
-                        Err(error)
-                    }
+                    Err(error) => Err(error),
                 };
                 let _ = reply.send(result);
+            }
+            WalCommand::MaintenanceTick => {
                 run_maintenance_cycle(&core, &mut writer);
             }
             WalCommand::Shutdown => break,
@@ -880,15 +1391,6 @@ fn durable_current_from_seed(seed: &ReplaySeed) -> DurableCurrent {
     }
 }
 
-/// Resolves the latest implicit snapshot used by latest-only reads and new scan sessions.
-#[must_use]
-pub(crate) fn resolve_latest_snapshot(state: &EngineState) -> ResolvedSnapshot {
-    ResolvedSnapshot {
-        snapshot_seqno: state.last_committed_seqno,
-        data_generation: state.data_generation,
-    }
-}
-
 /// Resolves an explicit or implicit read snapshot against the live engine state.
 pub(crate) fn resolve_snapshot_for_read(
     state: &EngineState,
@@ -1215,6 +1717,13 @@ fn wal_worker_send_error(error: mpsc::SendError<WalCommand>) -> Error {
     ))
 }
 
+fn wal_worker_recv_error(_error: mpsc::RecvError) -> Error {
+    Error::Io(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "engine worker dropped the synchronous reply channel",
+    ))
+}
+
 fn wal_worker_reply_error(_error: oneshot::error::RecvError) -> Error {
     Error::Io(std::io::Error::new(
         std::io::ErrorKind::BrokenPipe,
@@ -1259,7 +1768,7 @@ mod tests {
         CurrentFile, ReplaySeed, WalWriterTestOptions, build_current_bytes,
         build_temp_metadata_checkpoint_file, install_metadata_checkpoint, read_current,
     };
-    use crate::sevai::{LogicalShardStats, ScanRow, StatsResponse};
+    use crate::{LogicalShardStats, ScanRow, StatsResponse};
 
     static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
 

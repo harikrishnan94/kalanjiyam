@@ -8,10 +8,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use buffa::{EnumValue, Message};
 use pezhai::Error;
 use pezhai::sevai::{
-    Bound, DeleteRequest, ExternalMethod, ExternalRequest, ExternalResponse,
-    ExternalResponsePayload, GetRequest, PezhaiServer, PutRequest, ScanFetchNextRequest,
-    ScanStartRequest, StatsRequest, Status, StatusCode,
+    DeleteRequest, ExternalMethod, ExternalRequest, ExternalResponse, ExternalResponsePayload,
+    GetRequest, PezhaiServer, PutRequest, ScanFetchNextRequest, ScanStartRequest, StatsRequest,
+    Status, StatusCode,
 };
+use pezhai::{Bound, ScanPageLimits, ScanRange};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinSet;
@@ -314,11 +315,19 @@ fn decode_request_envelope(
                 &client_id,
                 request_id,
             )?;
+            let range = ScanRange::new(start_bound, end_bound).map_err(|error| {
+                Box::new(invalid_argument_response(
+                    client_id.clone(),
+                    request_id,
+                    error.to_string(),
+                ))
+            })?;
             ExternalMethod::ScanStart(ScanStartRequest {
-                start_bound,
-                end_bound,
-                max_records_per_page: request.max_records_per_page,
-                max_bytes_per_page: request.max_bytes_per_page,
+                range,
+                page_limits: ScanPageLimits {
+                    max_records_per_page: request.max_records_per_page,
+                    max_bytes_per_page: request.max_bytes_per_page,
+                },
             })
         }
         wire::request_envelope::Method::ScanFetchNext(request) => {
@@ -532,9 +541,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use buffa::Message;
-    use pezhai::sevai::{
-        LevelStats, LogicalShardStats, PezhaiServer, ScanFetchNextResponse, ScanRow,
-        ServerBootstrapArgs, StatsRequest as LogicalStatsRequest, StatsResponse,
+    use pezhai::sevai::{PezhaiServer, ServerBootstrapArgs, StatsRequest as LogicalStatsRequest};
+    use pezhai::{
+        LevelStats, LogicalShardStats, ScanPageLimits, ScanPageResponse, ScanRange, ScanRow,
+        StatsResponse,
     };
     use tokio::io::{AsyncRead, AsyncWriteExt};
     use tokio::sync::{Notify, oneshot};
@@ -600,10 +610,11 @@ mod tests {
         assert_eq!(
             request.method,
             ExternalMethod::ScanStart(pezhai::sevai::ScanStartRequest {
-                start_bound: Bound::Finite(b"ant".to_vec()),
-                end_bound: Bound::PosInf,
-                max_records_per_page: 32,
-                max_bytes_per_page: 2048,
+                range: ScanRange::new(Bound::Finite(b"ant".to_vec()), Bound::PosInf).unwrap(),
+                page_limits: ScanPageLimits {
+                    max_records_per_page: 32,
+                    max_bytes_per_page: 2048,
+                },
             })
         );
     }
@@ -618,23 +629,21 @@ mod tests {
                 retryable: false,
                 message: None,
             },
-            payload: Some(ExternalResponsePayload::Stats(
-                pezhai::sevai::StatsResponse {
-                    observation_seqno: 7,
-                    data_generation: 8,
-                    levels: vec![LevelStats {
-                        level_no: 1,
-                        file_count: 2,
-                        logical_bytes: 3,
-                        physical_bytes: 4,
-                    }],
-                    logical_shards: vec![LogicalShardStats {
-                        start_bound: Bound::NegInf,
-                        end_bound: Bound::Finite(b"yak".to_vec()),
-                        live_size_bytes: 9,
-                    }],
-                },
-            )),
+            payload: Some(ExternalResponsePayload::Stats(StatsResponse {
+                observation_seqno: 7,
+                data_generation: 8,
+                levels: vec![LevelStats {
+                    level_no: 1,
+                    file_count: 2,
+                    logical_bytes: 3,
+                    physical_bytes: 4,
+                }],
+                logical_shards: vec![LogicalShardStats {
+                    start_bound: Bound::NegInf,
+                    end_bound: Bound::Finite(b"yak".to_vec()),
+                    live_size_bytes: 9,
+                }],
+            })),
         });
 
         let payload = &frame[4..];
@@ -666,15 +675,13 @@ mod tests {
                 retryable: false,
                 message: None,
             },
-            payload: Some(ExternalResponsePayload::ScanFetchNext(
-                ScanFetchNextResponse {
-                    rows: vec![ScanRow {
-                        key: b"ant".to_vec(),
-                        value: b"value".to_vec(),
-                    }],
-                    eof: true,
-                },
-            )),
+            payload: Some(ExternalResponsePayload::ScanFetchNext(ScanPageResponse {
+                rows: vec![ScanRow {
+                    key: b"ant".to_vec(),
+                    value: b"value".to_vec(),
+                }],
+                eof: true,
+            })),
         });
 
         let payload = &frame[4..];

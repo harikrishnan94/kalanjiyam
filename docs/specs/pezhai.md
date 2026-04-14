@@ -2263,11 +2263,20 @@ The Rust binding exported by this repository uses these public names:
 - `ScanRange`
 - `ScanCursor`
 - `ScanRow`
+- `ScanPageLimits`
+- `ScanPageResponse`
 - `GetResponse`
 - `SyncResponse`
 - `StatsResponse`
 - `LevelStats`
 - `LogicalShardStats`
+- `WriteDecision`
+- `DurabilityWait`
+- `GetDecision`
+- `DeferredGet`
+- `PagedScan`
+- `ScanPageDecision`
+- `DeferredScanPage`
 - `Error`
 
 Rules:
@@ -2276,6 +2285,8 @@ Rules:
   [BEHAVIORAL]
 - `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`, `scan`, `sync`, and `stats`
   MUST be asynchronous in the Rust binding [BEHAVIORAL]
+- `prepare_put`, `prepare_delete`, `prepare_latest_get`, and `start_paged_scan`
+  MUST be synchronous admission helpers in the Rust binding [BEHAVIORAL]
 - no public API may expose `Mutex`, `RwLock`, or guard types, and no caller-managed lock may be
   required for correctness [BEHAVIORAL]
 - before the first await or delegated execution, public methods MAY validate arguments, resolve
@@ -2287,6 +2298,10 @@ Rules:
 - `get()` MAY complete inline only for active-memtable hits, `ScanCursor::next()` MAY complete
   inline only for active-memtable-only page production, and `stats()` MUST remain owner-state-only
   [BEHAVIORAL]
+- the engine-shared public types in this section MUST be canonical only at the
+  crate root `pezhai::*`; `pezhai::sevai` MUST NOT expose duplicate public
+  paths for `Bound`, `ScanRange`, `ScanRow`, `GetResponse`, `ScanPageResponse`,
+  `StatsResponse`, `LevelStats`, or `LogicalShardStats` [BEHAVIORAL]
 
 ### 9.1 `open(config_path)` (`FR-OPEN`)
 

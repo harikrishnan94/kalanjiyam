@@ -11,5 +11,9 @@ pub mod sevai;
 
 /// Crate-level error type shared by the Pezhai library surface.
 pub use error::Error;
-pub use iyakkam::{PezhaiEngine, ScanCursor, ScanRange, SnapshotHandle, SyncResponse};
-pub use sevai::{Bound, GetResponse, LevelStats, LogicalShardStats, ScanRow, StatsResponse};
+pub use iyakkam::{
+    Bound, DeferredGet, DeferredScanPage, DurabilityWait, GetDecision, GetResponse, LevelStats,
+    LogicalShardStats, PagedScan, PezhaiEngine, ScanCursor, ScanPageDecision, ScanPageLimits,
+    ScanPageResponse, ScanRange, ScanRow, SnapshotHandle, StatsResponse, SyncResponse,
+    WriteDecision,
+};

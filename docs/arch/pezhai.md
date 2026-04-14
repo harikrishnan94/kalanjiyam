@@ -29,12 +29,24 @@ The public Rust surface is exported from the crate root:
 - `ScanRange`
 - `ScanCursor`
 - `ScanRow`
+- `ScanPageLimits`
+- `ScanPageResponse`
 - `GetResponse`
 - `SyncResponse`
 - `StatsResponse`
 - `LevelStats`
 - `LogicalShardStats`
+- `WriteDecision`
+- `DurabilityWait`
+- `GetDecision`
+- `DeferredGet`
+- `PagedScan`
+- `ScanPageDecision`
+- `DeferredScanPage`
 - `Error`
+
+The shared engine types listed above are canonical only at `pezhai::*`.
+`pezhai::sevai` uses those types but does not re-export duplicate public paths.
 
 ### Runtime model
 
@@ -48,6 +60,9 @@ The public lifecycle contract is:
 - `close(self)` is synchronous
 - `create_snapshot`, `release_snapshot`, `put`, `delete`, `get`, `scan`,
   `sync`, and `stats` are asynchronous
+- `prepare_put`, `prepare_delete`, `prepare_latest_get`, and `start_paged_scan`
+  are synchronous admission helpers that return engine-owned decisions or
+  handles for later async execution
 
 ### Current milestone-4 state
 
@@ -102,20 +117,34 @@ The resulting split is:
   blocking file work outside the owner lock
 - `scan` captures one owned scan plan immediately and defers row materialization
   until `ScanCursor::next()`
+- `prepare_put` and `prepare_delete` append one WAL mutation without forcing
+  immediate fsync and return one engine-owned durability waiter when `per_write`
+  acknowledgement still needs the durable frontier
+- `prepare_latest_get` returns either one inline `GetResponse` or one
+  `DeferredGet` that performs blocking file reads later
+- `start_paged_scan` returns one `PagedScan` handle whose `prepare_next_page()`
+  method yields either one inline `ScanPageResponse` or one `DeferredScanPage`
 
 ### Worker and publication model
 
 The engine still uses one internal worker thread for sequential WAL ownership.
-That worker now performs five distinct responsibilities:
+That worker now performs four distinct responsibilities:
 
 - append `Put` and `Delete` records in seqno order
-- advance the explicit durable frontier for `sync()`
 - publish flush and compaction results after ordinary writes have installed any
   needed in-memory freeze
 - publish `LogicalShardInstall` after exact latest-state recomputation chooses
   one split or merge candidate
 - install metadata checkpoints, update `CURRENT`, truncate covered closed WAL
   segments, and best-effort delete GC-eligible data files
+
+Explicit durability now has two public entry points:
+
+- direct `sync()` asks the worker for one immutable sync plan, executes the
+  fsync outside the worker, then records the covered durable frontier
+- `DurabilityWait::wait()` executes the same kind of immutable sync plan for one
+  prepared write and then re-enters the worker only for the follow-on
+  maintenance tick
 
 Flush and compaction both follow the same publication boundary:
 

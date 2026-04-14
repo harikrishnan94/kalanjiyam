@@ -13,26 +13,11 @@ use tokio::time::Instant;
 
 use crate::config::{RuntimeConfig, SyncMode, load_runtime_config};
 use crate::error::Error;
-use crate::idam::StoreLayout;
-use crate::iyakkam::{
-    CapturedGet, EngineTestOptions, OpenedEngineRuntime, ResolvedSnapshot,
-    append_live_mutation_unsynced, capture_get_request, capture_scan_page_request,
-    collect_stats_response, create_snapshot_handle, open_engine_runtime, publish_compaction_build,
-    publish_flush_build, publish_logical_install_payload, release_snapshot_handle,
-    resolve_latest_snapshot, validate_key, validate_scan_range, validate_value,
-};
-use crate::nilaimai::{
-    CompactionBuildResult, CompactionPlan, EngineState, FlushBuildResult, FlushPlan,
-    LogicalMaintenancePlan, LogicalShardInstallPayload, MetadataCheckpointCapture, Mutation,
-};
-use crate::pani::{
-    ScanPagePlan, ScanPageResult, build_compaction_output, build_flush_output, execute_gc,
-    execute_logical_maintenance_plan, execute_point_read, execute_scan_page_plan,
-};
-use crate::pathivu::{
-    CurrentFile, WalAppendState, WalSyncPlan, WalSyncResult, build_temp_metadata_checkpoint_file,
-    execute_wal_sync_plan, install_current, install_metadata_checkpoint,
-    list_canonical_data_file_ids, retained_wal_bytes_after, truncate_covered_closed_wal_segments,
+use crate::iyakkam::EngineTestOptions;
+use crate::{
+    DeferredGet, DeferredScanPage, DurabilityWait, GetDecision, GetResponse, PagedScan,
+    PezhaiEngine, ScanPageDecision, ScanPageLimits, ScanPageResponse, ScanRange, StatsResponse,
+    WriteDecision,
 };
 
 /// Startup arguments for `PezhaiServer`.
@@ -120,14 +105,10 @@ pub struct GetRequest {
 /// Logical `ScanStart` request payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanStartRequest {
-    /// Inclusive lower bound, or negative infinity.
-    pub start_bound: Bound,
-    /// Exclusive upper bound, or positive infinity.
-    pub end_bound: Bound,
-    /// Maximum number of rows the server should emit per page.
-    pub max_records_per_page: u32,
-    /// Maximum logical bytes the server should target per page.
-    pub max_bytes_per_page: u32,
+    /// Half-open key range pinned for the scan session.
+    pub range: ScanRange,
+    /// Page-size limits applied to each fetch.
+    pub page_limits: ScanPageLimits,
 }
 
 /// Logical `ScanFetchNext` request payload.
@@ -161,7 +142,7 @@ pub enum ExternalResponsePayload {
     Delete(DeleteResponse),
     Get(GetResponse),
     ScanStart(ScanStartResponse),
-    ScanFetchNext(ScanFetchNextResponse),
+    ScanFetchNext(ScanPageResponse),
     Stats(StatsResponse),
 }
 
@@ -189,14 +170,6 @@ pub enum StatusCode {
     Cancelled,
 }
 
-/// Inclusive or infinite bound for the logical scan API.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Bound {
-    NegInf,
-    Finite(Vec<u8>),
-    PosInf,
-}
-
 /// Empty `Put` success payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PutResponse;
@@ -204,19 +177,6 @@ pub struct PutResponse;
 /// Empty `Delete` success payload.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DeleteResponse;
-
-/// `Get` success payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GetResponse {
-    /// Whether a value was present.
-    pub found: bool,
-    /// Current value when `found` is true.
-    pub value: Option<Vec<u8>>,
-    /// Latest committed seqno observed at admission time.
-    pub observation_seqno: u64,
-    /// Latest data generation observed at admission time.
-    pub data_generation: u64,
-}
 
 /// `ScanStart` success payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -227,61 +187,6 @@ pub struct ScanStartResponse {
     pub observation_seqno: u64,
     /// Data generation pinned for the scan snapshot.
     pub data_generation: u64,
-}
-
-/// One row returned by a paged scan.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanRow {
-    /// Row key bytes.
-    pub key: Vec<u8>,
-    /// Row value bytes.
-    pub value: Vec<u8>,
-}
-
-/// `ScanFetchNext` success payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ScanFetchNextResponse {
-    /// Scan rows returned for the page.
-    pub rows: Vec<ScanRow>,
-    /// Whether this page reached the end of the scan snapshot.
-    pub eof: bool,
-}
-
-/// One level-wise stats entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LevelStats {
-    /// Level number within the storage hierarchy.
-    pub level_no: u32,
-    /// Number of files in the level.
-    pub file_count: u64,
-    /// Logical bytes represented by the level.
-    pub logical_bytes: u64,
-    /// Physical bytes consumed by the level.
-    pub physical_bytes: u64,
-}
-
-/// One logical-shard stats entry.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogicalShardStats {
-    /// Inclusive lower bound for the shard.
-    pub start_bound: Bound,
-    /// Exclusive upper bound for the shard.
-    pub end_bound: Bound,
-    /// Current live logical bytes tracked for the shard.
-    pub live_size_bytes: u64,
-}
-
-/// `Stats` success payload.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StatsResponse {
-    /// Latest committed seqno visible at reply time.
-    pub observation_seqno: u64,
-    /// Latest data generation visible at reply time.
-    pub data_generation: u64,
-    /// Shared-level stats entries.
-    pub levels: Vec<LevelStats>,
-    /// Current logical-shard stats entries.
-    pub logical_shards: Vec<LogicalShardStats>,
 }
 
 /// Shared lifecycle state mirrored outside the owner actor for admission checks.
@@ -453,15 +358,12 @@ enum ControlCommand {
         task_id: u64,
         result: WorkerResult,
     },
-    WalSyncSucceeded(WalSyncResult),
+    WalSyncSucceeded(u64),
     WalSyncFailed {
         target_seqno: u64,
         message: String,
     },
     SweepExpiredSessions,
-    RetryMaintenance {
-        task_id: u64,
-    },
 }
 
 /// One queued external request identified by `(client_id, request_id)`.
@@ -531,44 +433,14 @@ enum ScanTerminalState {
 /// One server-owned scan session pinned to a single snapshot handle.
 struct ScanSession {
     scan_id: u64,
-    snapshot_handle: crate::SnapshotHandle,
     snapshot_seqno: u64,
     data_generation: u64,
-    start_bound: Bound,
-    end_bound: Bound,
-    max_records_per_page: u32,
-    max_bytes_per_page: u32,
-    resume_after_key: Option<Vec<u8>>,
+    paged_scan: PagedScan,
     queued_fetches: VecDeque<RequestKey>,
     active_fetch: Option<RequestKey>,
     in_flight_task_id: Option<u64>,
     terminal_state: ScanTerminalState,
     expires_at: Instant,
-}
-
-/// One maintenance task plan that can be retried without changing the public API.
-#[derive(Clone, Debug)]
-enum MaintenancePlan {
-    Flush(FlushPlan),
-    Compact(CompactionPlan),
-    Logical(LogicalMaintenancePlan),
-    Checkpoint(CheckpointTaskPlan),
-    Gc(Vec<u64>),
-}
-
-/// One checkpoint task captured from the current engine state.
-#[derive(Clone, Debug)]
-struct CheckpointTaskPlan {
-    capture: MetadataCheckpointCapture,
-    page_size_bytes: u32,
-    temp_tag: String,
-}
-
-/// One temporary checkpoint build returned by the worker pool.
-struct CheckpointBuildResult {
-    capture: MetadataCheckpointCapture,
-    temp_tag: String,
-    temp_path: PathBuf,
 }
 
 /// One worker-pool task sent through the bounded task queue.
@@ -580,57 +452,30 @@ struct WorkerTask {
 
 /// The stateless worker payloads used by reads and background maintenance.
 enum WorkerTaskPayload {
-    Get(crate::nilaimai::PointReadPlan),
-    ScanPage(ScanPagePlan),
-    Flush {
-        plan: FlushPlan,
-        page_size_bytes: u32,
-    },
-    Compact {
-        plan: CompactionPlan,
-        page_size_bytes: u32,
-    },
-    Logical(LogicalMaintenancePlan),
-    Checkpoint(CheckpointTaskPlan),
-    Gc(Vec<u64>),
+    Get(DeferredGet),
+    ScanPage(DeferredScanPage),
 }
 
 /// One worker result delivered back onto the owner control channel.
 enum WorkerResult {
-    Get(Result<Option<Vec<u8>>, Error>),
-    ScanPage(Result<ScanPageResult, Error>),
-    Flush(Result<FlushBuildResult, Error>),
-    Compact(Result<CompactionBuildResult, Error>),
-    Logical(Result<Option<LogicalShardInstallPayload>, Error>),
-    Checkpoint(Result<CheckpointBuildResult, Error>),
-    Gc(Result<Vec<u64>, Error>),
+    Get(Result<GetResponse, Error>),
+    ScanPage(Result<ScanPageResponse, Error>),
 }
 
 /// One tracked worker task entry keyed by `task_id`.
 enum TaskEntry {
     Get {
         request_key: RequestKey,
-        snapshot: ResolvedSnapshot,
     },
     ScanPage {
         request_key: RequestKey,
         scan_id: u64,
     },
-    Maintenance {
-        plan: MaintenancePlan,
-        attempt: u8,
-    },
 }
 
-/// One owner-side WAL sync request that has not yet reached the sync actor.
+/// One owner-side durability waiter that has not yet reached the sync actor.
 struct PendingWalSyncPlan {
-    plan: WalSyncPlan,
-}
-
-/// One cached pending sync request inside the dedicated WAL sync actor.
-struct WalSyncPendingEntry {
-    plan: WalSyncPlan,
-    oldest_requested_at: Instant,
+    wait: DurabilityWait,
 }
 
 /// One owner actor that embeds the recovered engine state directly.
@@ -638,11 +483,8 @@ struct OwnerState {
     _args: ServerBootstrapArgs,
     config: RuntimeConfig,
     shared: Arc<SharedServerHandle>,
-    control_tx: mpsc::UnboundedSender<ControlCommand>,
     lifecycle: SharedLifecycle,
-    engine: EngineState,
-    layout: StoreLayout,
-    wal_append_state: WalAppendState,
+    engine: PezhaiEngine,
     next_scan_id: u64,
     next_task_id: u64,
     next_hidden_cancel_id: u64,
@@ -655,13 +497,8 @@ struct OwnerState {
     task_registry: BTreeMap<u64, TaskEntry>,
     in_flight_scan_tasks: usize,
     pending_wal_sync_plans: BTreeMap<u64, PendingWalSyncPlan>,
-    active_flushes: usize,
-    active_compactions: usize,
-    checkpoint_in_flight: bool,
-    logical_in_flight: bool,
-    gc_in_flight: bool,
     worker_tx: Option<mpsc::Sender<WorkerTask>>,
-    wal_sync_tx: Option<mpsc::Sender<WalSyncPlan>>,
+    wal_sync_tx: Option<mpsc::Sender<DurabilityWait>>,
     worker_handles: Vec<JoinHandle<()>>,
     wal_sync_handle: Option<JoinHandle<()>>,
     expiry_handle: Option<JoinHandle<()>>,
@@ -786,16 +623,14 @@ impl PezhaiServer {
         ));
 
         let config_path = args.config_path.clone();
-        let config_for_open = config.clone();
         let engine_options = options.engine;
-        let opened = task::spawn_blocking(move || {
-            open_engine_runtime(&config_path, config_for_open, engine_options)
+        let engine = task::spawn_blocking(move || {
+            PezhaiEngine::open_with_options(&config_path, engine_options)
         })
         .await
         .map_err(spawn_blocking_join_error)??;
 
         let (worker_tx, worker_handles) = spawn_worker_pool(
-            opened.layout.clone(),
             control_tx.clone(),
             config.server_limits.worker_parallelism,
             config.server_limits.max_worker_tasks,
@@ -806,7 +641,6 @@ impl PezhaiServer {
         let wal_sync_handle = tokio::spawn(wal_sync_actor(
             wal_sync_rx,
             control_tx.clone(),
-            config.wal.group_commit_bytes,
             Duration::from_millis(config.wal.group_commit_max_delay_ms),
             options.wal_sync_delay,
         ));
@@ -815,9 +649,8 @@ impl PezhaiServer {
         let owner = OwnerState::new(
             args,
             config,
-            opened,
+            engine,
             Arc::clone(&shared),
-            control_tx,
             worker_tx,
             wal_sync_tx,
             worker_handles,
@@ -856,11 +689,10 @@ impl OwnerState {
     fn new(
         args: ServerBootstrapArgs,
         config: RuntimeConfig,
-        opened: OpenedEngineRuntime,
+        engine: PezhaiEngine,
         shared: Arc<SharedServerHandle>,
-        control_tx: mpsc::UnboundedSender<ControlCommand>,
         worker_tx: mpsc::Sender<WorkerTask>,
-        wal_sync_tx: mpsc::Sender<WalSyncPlan>,
+        wal_sync_tx: mpsc::Sender<DurabilityWait>,
         worker_handles: Vec<JoinHandle<()>>,
         wal_sync_handle: JoinHandle<()>,
         expiry_handle: JoinHandle<()>,
@@ -869,11 +701,8 @@ impl OwnerState {
             _args: args,
             config,
             shared,
-            control_tx,
             lifecycle: SharedLifecycle::Ready,
-            engine: opened.state,
-            layout: opened.layout,
-            wal_append_state: opened.wal_append_state,
+            engine,
             next_scan_id: 1,
             next_task_id: 1,
             next_hidden_cancel_id: 1,
@@ -886,11 +715,6 @@ impl OwnerState {
             task_registry: BTreeMap::new(),
             in_flight_scan_tasks: 0,
             pending_wal_sync_plans: BTreeMap::new(),
-            active_flushes: 0,
-            active_compactions: 0,
-            checkpoint_in_flight: false,
-            logical_in_flight: false,
-            gc_in_flight: false,
             worker_tx: Some(worker_tx),
             wal_sync_tx: Some(wal_sync_tx),
             worker_handles,
@@ -957,9 +781,6 @@ impl OwnerState {
             }
             ControlCommand::SweepExpiredSessions => {
                 self.expire_idle_sessions();
-            }
-            ControlCommand::RetryMaintenance { task_id } => {
-                self.retry_maintenance(task_id);
             }
         }
     }
@@ -1029,21 +850,9 @@ impl OwnerState {
         body: &PutRequest,
         cancel_token: &str,
     ) -> Option<ExternalResponse> {
-        // Writes become visible as soon as the owner appends and updates the active memtable.
-        // In `PerWrite` mode the response stays parked on a durability waiter until the WAL
-        // sync actor publishes a covering frontier.
-        if let Err(error) = validate_key(&body.key) {
-            return Some(error_response(request, error, false));
-        }
-        if let Err(error) = validate_value(&body.value) {
-            return Some(error_response(request, error, false));
-        }
-        if let Some(error) = self.engine.write_stop_error() {
-            return Some(error_response(request, error, true));
-        }
-
-        let sync_mode = self.config.engine.sync_mode;
-        if sync_mode == SyncMode::PerWrite
+        // The server still owns waiter backpressure and batching, but the write itself now routes
+        // through the public engine surface instead of mutating engine state directly.
+        if self.config.engine.sync_mode == SyncMode::PerWrite
             && self.waiting_durability_waiters
                 >= self.config.server_limits.max_waiting_durability_waiters as usize
         {
@@ -1054,45 +863,37 @@ impl OwnerState {
             ));
         }
 
-        let outcome = match append_live_mutation_unsynced(
-            &mut self.engine,
-            &mut self.wal_append_state,
-            &Mutation::Put {
-                key: body.key.clone(),
-                value: body.value.clone(),
-            },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(error_response(request, error, true)),
+        let decision = match self.engine.prepare_put(&body.key, &body.value) {
+            Ok(decision) => decision,
+            Err(error) => {
+                let io_retryable = !matches!(error, Error::InvalidArgument(_));
+                return Some(error_response(request, error, io_retryable));
+            }
         };
-        self.drive_maintenance();
 
-        if sync_mode == SyncMode::Manual || outcome.durable_frontier_covered {
-            return Some(ok_response(
+        match decision {
+            WriteDecision::Ready => Some(ok_response(
                 request.client_id.clone(),
                 request.request_id,
                 ExternalResponsePayload::Put(PutResponse),
-            ));
+            )),
+            WriteDecision::DurabilityWait(wait) => {
+                let target_seqno = wait.target_seqno();
+                self.track_request(
+                    request_key.clone(),
+                    cancel_token.to_string(),
+                    AsyncRequestKind::Put,
+                    RequestPhase::WaitingDurability { target_seqno },
+                );
+                self.durability_waiters
+                    .entry(target_seqno)
+                    .or_default()
+                    .push(request_key.clone());
+                self.waiting_durability_waiters += 1;
+                self.enqueue_wal_sync_wait(wait);
+                None
+            }
         }
-
-        self.track_request(
-            request_key.clone(),
-            cancel_token.to_string(),
-            AsyncRequestKind::Put,
-            RequestPhase::WaitingDurability {
-                target_seqno: outcome.target_seqno,
-            },
-        );
-        self.durability_waiters
-            .entry(outcome.target_seqno)
-            .or_default()
-            .push(request_key.clone());
-        self.waiting_durability_waiters += 1;
-        match self.wal_append_state.sync_plan_for_outcome(&outcome) {
-            Ok(plan) => self.enqueue_wal_sync_plan(plan),
-            Err(error) => self.handle_wal_sync_failure(outcome.target_seqno, error.to_string()),
-        }
-        None
     }
 
     fn handle_delete(
@@ -1102,15 +903,7 @@ impl OwnerState {
         body: &DeleteRequest,
         cancel_token: &str,
     ) -> Option<ExternalResponse> {
-        if let Err(error) = validate_key(&body.key) {
-            return Some(error_response(request, error, false));
-        }
-        if let Some(error) = self.engine.write_stop_error() {
-            return Some(error_response(request, error, true));
-        }
-
-        let sync_mode = self.config.engine.sync_mode;
-        if sync_mode == SyncMode::PerWrite
+        if self.config.engine.sync_mode == SyncMode::PerWrite
             && self.waiting_durability_waiters
                 >= self.config.server_limits.max_waiting_durability_waiters as usize
         {
@@ -1121,44 +914,37 @@ impl OwnerState {
             ));
         }
 
-        let outcome = match append_live_mutation_unsynced(
-            &mut self.engine,
-            &mut self.wal_append_state,
-            &Mutation::Delete {
-                key: body.key.clone(),
-            },
-        ) {
-            Ok(outcome) => outcome,
-            Err(error) => return Some(error_response(request, error, true)),
+        let decision = match self.engine.prepare_delete(&body.key) {
+            Ok(decision) => decision,
+            Err(error) => {
+                let io_retryable = !matches!(error, Error::InvalidArgument(_));
+                return Some(error_response(request, error, io_retryable));
+            }
         };
-        self.drive_maintenance();
 
-        if sync_mode == SyncMode::Manual || outcome.durable_frontier_covered {
-            return Some(ok_response(
+        match decision {
+            WriteDecision::Ready => Some(ok_response(
                 request.client_id.clone(),
                 request.request_id,
                 ExternalResponsePayload::Delete(DeleteResponse),
-            ));
+            )),
+            WriteDecision::DurabilityWait(wait) => {
+                let target_seqno = wait.target_seqno();
+                self.track_request(
+                    request_key.clone(),
+                    cancel_token.to_string(),
+                    AsyncRequestKind::Delete,
+                    RequestPhase::WaitingDurability { target_seqno },
+                );
+                self.durability_waiters
+                    .entry(target_seqno)
+                    .or_default()
+                    .push(request_key.clone());
+                self.waiting_durability_waiters += 1;
+                self.enqueue_wal_sync_wait(wait);
+                None
+            }
         }
-
-        self.track_request(
-            request_key.clone(),
-            cancel_token.to_string(),
-            AsyncRequestKind::Delete,
-            RequestPhase::WaitingDurability {
-                target_seqno: outcome.target_seqno,
-            },
-        );
-        self.durability_waiters
-            .entry(outcome.target_seqno)
-            .or_default()
-            .push(request_key.clone());
-        self.waiting_durability_waiters += 1;
-        match self.wal_append_state.sync_plan_for_outcome(&outcome) {
-            Ok(plan) => self.enqueue_wal_sync_plan(plan),
-            Err(error) => self.handle_wal_sync_failure(outcome.target_seqno, error.to_string()),
-        }
-        None
     }
 
     fn handle_get(
@@ -1168,29 +954,13 @@ impl OwnerState {
         body: &GetRequest,
         cancel_token: &str,
     ) -> Option<ExternalResponse> {
-        // The owner resolves the latest read snapshot once, answers active-memtable hits inline,
-        // and only hands immutable frozen/file work to the worker pool after the fast path misses.
-        if let Err(error) = validate_key(&body.key) {
-            return Some(error_response(request, error, false));
-        }
-
-        let snapshot = resolve_latest_snapshot(&self.engine);
-        let captured = match capture_get_request(&self.engine, &body.key, snapshot) {
-            Ok(captured) => captured,
-            Err(error) => return Some(error_response(request, error, false)),
-        };
-        match captured {
-            CapturedGet::Inline(value) => Some(ok_response(
+        match self.engine.prepare_latest_get(&body.key) {
+            Ok(GetDecision::Ready(response)) => Some(ok_response(
                 request.client_id.clone(),
                 request.request_id,
-                ExternalResponsePayload::Get(GetResponse {
-                    found: value.is_some(),
-                    value,
-                    observation_seqno: snapshot.snapshot_seqno,
-                    data_generation: snapshot.data_generation,
-                }),
+                ExternalResponsePayload::Get(response),
             )),
-            CapturedGet::Deferred(plan) => {
+            Ok(GetDecision::Deferred(get)) => {
                 let cancel_flag = Arc::new(AtomicBool::new(false));
                 let task_id = self.next_task_id();
                 let Some(worker_tx) = self.worker_tx.as_ref() else {
@@ -1204,7 +974,7 @@ impl OwnerState {
                 match worker_tx.try_send(WorkerTask {
                     task_id,
                     cancel_flag: Arc::clone(&cancel_flag),
-                    payload: WorkerTaskPayload::Get(plan),
+                    payload: WorkerTaskPayload::Get(get),
                 }) {
                     Ok(()) => {
                         self.track_request(
@@ -1219,7 +989,6 @@ impl OwnerState {
                             task_id,
                             TaskEntry::Get {
                                 request_key: request_key.clone(),
-                                snapshot,
                             },
                         );
                         None
@@ -1237,6 +1006,7 @@ impl OwnerState {
                     )),
                 }
             }
+            Err(error) => Some(error_response(request, error, false)),
         }
     }
 
@@ -1252,25 +1022,27 @@ impl OwnerState {
                 "scan session table is full",
             );
         }
-        if body.max_records_per_page == 0 {
+        if body.page_limits.max_records_per_page == 0 {
             return invalid_argument_response(
                 request.client_id.clone(),
                 request.request_id,
                 "max_records_per_page must be greater than zero",
             );
         }
-        if body.max_bytes_per_page == 0 {
+        if body.page_limits.max_bytes_per_page == 0 {
             return invalid_argument_response(
                 request.client_id.clone(),
                 request.request_id,
                 "max_bytes_per_page must be greater than zero",
             );
         }
-        if let Err(error) = validate_scan_range(&body.start_bound, &body.end_bound) {
-            return error_response(request, error, false);
-        }
-
-        let snapshot_handle = create_snapshot_handle(&mut self.engine);
+        let paged_scan = match self
+            .engine
+            .start_paged_scan(body.range.clone(), body.page_limits)
+        {
+            Ok(paged_scan) => paged_scan,
+            Err(error) => return error_response(request, error, false),
+        };
         let scan_id = self.next_scan_id;
         self.next_scan_id += 1;
         let expires_at = self.scan_expiry_deadline();
@@ -1278,14 +1050,9 @@ impl OwnerState {
             scan_id,
             ScanSession {
                 scan_id,
-                snapshot_seqno: snapshot_handle.snapshot_seqno(),
-                data_generation: snapshot_handle.data_generation(),
-                snapshot_handle,
-                start_bound: body.start_bound.clone(),
-                end_bound: body.end_bound.clone(),
-                max_records_per_page: body.max_records_per_page,
-                max_bytes_per_page: body.max_bytes_per_page,
-                resume_after_key: None,
+                snapshot_seqno: paged_scan.observation_seqno(),
+                data_generation: paged_scan.data_generation(),
+                paged_scan,
                 queued_fetches: VecDeque::new(),
                 active_fetch: None,
                 in_flight_task_id: None,
@@ -1372,7 +1139,11 @@ impl OwnerState {
         ok_response(
             request.client_id.clone(),
             request.request_id,
-            ExternalResponsePayload::Stats(collect_stats_response(&self.engine)),
+            ExternalResponsePayload::Stats(
+                self.engine
+                    .current_stats()
+                    .expect("stats should only fail when the engine mutex is poisoned"),
+            ),
         )
     }
 
@@ -1467,26 +1238,18 @@ impl OwnerState {
             return;
         };
         match entry {
-            TaskEntry::Get {
-                request_key,
-                snapshot,
-            } => {
+            TaskEntry::Get { request_key } => {
                 if !self.requests.contains_key(&request_key) {
                     return;
                 }
                 if let WorkerResult::Get(result) = result {
                     match result {
-                        Ok(value) => self.complete_request(
+                        Ok(response) => self.complete_request(
                             &request_key,
                             ok_response(
                                 request_key.0.clone(),
                                 request_key.1,
-                                ExternalResponsePayload::Get(GetResponse {
-                                    found: value.is_some(),
-                                    value,
-                                    observation_seqno: snapshot.snapshot_seqno,
-                                    data_generation: snapshot.data_generation,
-                                }),
+                                ExternalResponsePayload::Get(response),
                             ),
                         ),
                         Err(error) => self.complete_request(
@@ -1522,140 +1285,13 @@ impl OwnerState {
                     }
                 }
             }
-            TaskEntry::Maintenance { plan, attempt } => {
-                self.handle_maintenance_result(task_id, plan, attempt, result);
-            }
         }
     }
 
-    fn handle_maintenance_result(
-        &mut self,
-        task_id: u64,
-        plan: MaintenancePlan,
-        attempt: u8,
-        result: WorkerResult,
-    ) {
-        let io_retry = |owner: &mut Self| {
-            if owner.engine.write_stop_error().is_some() {
-                owner.finish_maintenance_task(task_id, &plan);
-                return;
-            }
-            if let Some(delay) = maintenance_retry_delay(attempt) {
-                owner.task_registry.insert(
-                    task_id,
-                    TaskEntry::Maintenance {
-                        plan: plan.clone(),
-                        attempt: attempt + 1,
-                    },
-                );
-                spawn_retry_timer(owner.control_tx.clone(), task_id, delay);
-            } else {
-                owner.finish_maintenance_task(task_id, &plan);
-            }
-        };
-
-        match (plan.clone(), result) {
-            (MaintenancePlan::Flush(plan), WorkerResult::Flush(result)) => match result {
-                Ok(build) => match publish_flush_build(
-                    &mut self.engine,
-                    &mut self.wal_append_state,
-                    &self.layout,
-                    &plan,
-                    &build,
-                    self.config.engine.sync_mode,
-                ) {
-                    Ok(_outcome) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Flush(plan));
-                        self.drive_maintenance();
-                    }
-                    Err(Error::Stale(_)) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Flush(plan));
-                    }
-                    Err(Error::Io(_)) => io_retry(self),
-                    Err(_) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Flush(plan));
-                    }
-                },
-                Err(Error::Io(_)) => io_retry(self),
-                Err(_) => self.finish_maintenance_task(task_id, &MaintenancePlan::Flush(plan)),
-            },
-            (MaintenancePlan::Compact(plan), WorkerResult::Compact(result)) => match result {
-                Ok(build) => match publish_compaction_build(
-                    &mut self.engine,
-                    &mut self.wal_append_state,
-                    &self.layout,
-                    &plan,
-                    &build,
-                    self.config.engine.sync_mode,
-                ) {
-                    Ok(_outcome) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Compact(plan));
-                        self.drive_maintenance();
-                    }
-                    Err(Error::Stale(_)) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Compact(plan));
-                    }
-                    Err(Error::Io(_)) => io_retry(self),
-                    Err(_) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Compact(plan));
-                    }
-                },
-                Err(Error::Io(_)) => io_retry(self),
-                Err(_) => self.finish_maintenance_task(task_id, &MaintenancePlan::Compact(plan)),
-            },
-            (MaintenancePlan::Logical(plan), WorkerResult::Logical(result)) => match result {
-                Ok(Some(payload)) => match publish_logical_install_payload(
-                    &mut self.engine,
-                    &mut self.wal_append_state,
-                    &payload,
-                    self.config.engine.sync_mode,
-                ) {
-                    Ok(_outcome) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Logical(plan));
-                    }
-                    Err(Error::Stale(_)) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Logical(plan));
-                    }
-                    Err(Error::Io(_)) => io_retry(self),
-                    Err(_) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Logical(plan));
-                    }
-                },
-                Ok(None) => self.finish_maintenance_task(task_id, &MaintenancePlan::Logical(plan)),
-                Err(Error::Io(_)) => io_retry(self),
-                Err(_) => self.finish_maintenance_task(task_id, &MaintenancePlan::Logical(plan)),
-            },
-            (MaintenancePlan::Checkpoint(plan), WorkerResult::Checkpoint(result)) => match result {
-                Ok(build) => match self.install_checkpoint_build(&build) {
-                    Ok(()) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Checkpoint(plan));
-                    }
-                    Err(Error::Io(_)) => io_retry(self),
-                    Err(_) => {
-                        self.finish_maintenance_task(task_id, &MaintenancePlan::Checkpoint(plan));
-                    }
-                },
-                Err(Error::Io(_)) => io_retry(self),
-                Err(_) => self.finish_maintenance_task(task_id, &MaintenancePlan::Checkpoint(plan)),
-            },
-            (MaintenancePlan::Gc(file_ids), WorkerResult::Gc(result)) => match result {
-                Ok(_deleted) => {
-                    self.finish_maintenance_task(task_id, &MaintenancePlan::Gc(file_ids));
-                }
-                Err(Error::Io(_)) => io_retry(self),
-                Err(_) => self.finish_maintenance_task(task_id, &MaintenancePlan::Gc(file_ids)),
-            },
-            (plan, _) => {
-                self.finish_maintenance_task(task_id, &plan);
-            }
-        }
-    }
-
-    fn handle_wal_sync_success(&mut self, result: WalSyncResult) {
-        self.engine.mark_synced(result.durable_seqno_target);
+    fn handle_wal_sync_success(&mut self, durable_seqno_target: u64) {
         let satisfied = self
             .durability_waiters
-            .range(..=result.durable_seqno_target)
+            .range(..=durable_seqno_target)
             .map(|(target, _)| *target)
             .collect::<Vec<_>>();
         for target_seqno in satisfied {
@@ -1679,13 +1315,11 @@ impl OwnerState {
             }
         }
         self.flush_pending_wal_sync_plans();
-        self.drive_maintenance();
     }
 
     fn handle_wal_sync_failure(&mut self, _target_seqno: u64, message: String) {
         // Once WAL durability fails, later writes stay blocked until restart. The visible writes
         // that were waiting on this batch are failed with retryable `IO`, but reads continue.
-        self.engine.mark_write_failed(message.clone());
         self.pending_wal_sync_plans.clear();
 
         let waiting_targets = self.durability_waiters.keys().copied().collect::<Vec<_>>();
@@ -1723,23 +1357,6 @@ impl OwnerState {
             .collect::<Vec<_>>();
         for scan_id in expired {
             self.expire_scan_session(scan_id, "scan session expired");
-        }
-    }
-
-    fn retry_maintenance(&mut self, task_id: u64) {
-        let Some(TaskEntry::Maintenance { plan, attempt }) = self.task_registry.remove(&task_id)
-        else {
-            return;
-        };
-        if !self.dispatch_maintenance_task(task_id, &plan, attempt) {
-            self.task_registry.insert(
-                task_id,
-                TaskEntry::Maintenance {
-                    plan: plan.clone(),
-                    attempt,
-                },
-            );
-            spawn_retry_timer(self.control_tx.clone(), task_id, Duration::from_millis(50));
         }
     }
 
@@ -1921,17 +1538,14 @@ impl OwnerState {
             .front()
             .expect("queued fetch should exist")
             .clone();
-        let page_plan = match capture_scan_page_request(
-            &self.engine,
-            scan_id,
-            &session.snapshot_handle,
-            &session.start_bound,
-            &session.end_bound,
-            session.resume_after_key.clone(),
-            session.max_records_per_page,
-            session.max_bytes_per_page,
-        ) {
-            Ok(plan) => plan,
+        let decision = match self
+            .scan_sessions
+            .get_mut(&scan_id)
+            .expect("scan session should exist")
+            .paged_scan
+            .prepare_next_page()
+        {
+            Ok(decision) => decision,
             Err(error) => {
                 self.remove_queued_scan_fetch(scan_id, &request_key);
                 self.complete_request(
@@ -1942,7 +1556,7 @@ impl OwnerState {
             }
         };
 
-        if page_plan.is_active_only() {
+        if let ScanPageDecision::Ready(page) = decision {
             let expires_at = self.scan_expiry_deadline();
             let session = self
                 .scan_sessions
@@ -1955,20 +1569,7 @@ impl OwnerState {
             session.active_fetch = Some(request_key.clone());
             session.in_flight_task_id = None;
             session.expires_at = expires_at;
-            let result = execute_scan_page_plan(&self.layout, &page_plan);
-            match result {
-                Ok(page) => self.finish_scan_page(scan_id, &request_key, page),
-                Err(error) => {
-                    self.clear_active_scan_fetch(scan_id);
-                    if self.requests.contains_key(&request_key) {
-                        self.complete_request(
-                            &request_key,
-                            error_response_for_key(&request_key, error, true),
-                        );
-                    }
-                    self.maybe_start_next_scan_fetch(scan_id);
-                }
-            }
+            self.finish_scan_page(scan_id, &request_key, page);
             return;
         }
 
@@ -1982,10 +1583,13 @@ impl OwnerState {
 
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let task_id = self.next_task_id();
+        let ScanPageDecision::Deferred(page) = decision else {
+            return;
+        };
         match worker_tx.try_send(WorkerTask {
             task_id,
             cancel_flag: Arc::clone(&cancel_flag),
-            payload: WorkerTaskPayload::ScanPage(page_plan),
+            payload: WorkerTaskPayload::ScanPage(*page),
         }) {
             Ok(()) => {
                 let expires_at = self.scan_expiry_deadline();
@@ -2020,7 +1624,7 @@ impl OwnerState {
         }
     }
 
-    fn finish_scan_page(&mut self, scan_id: u64, request_key: &RequestKey, page: ScanPageResult) {
+    fn finish_scan_page(&mut self, scan_id: u64, request_key: &RequestKey, page: ScanPageResponse) {
         let expires_at = self.scan_expiry_deadline();
         let Some(session) = self.scan_sessions.get_mut(&scan_id) else {
             return;
@@ -2035,7 +1639,7 @@ impl OwnerState {
                 ok_response(
                     request_key.0.clone(),
                     request_key.1,
-                    ExternalResponsePayload::ScanFetchNext(ScanFetchNextResponse {
+                    ExternalResponsePayload::ScanFetchNext(ScanPageResponse {
                         rows: page.rows,
                         eof: true,
                     }),
@@ -2045,17 +1649,12 @@ impl OwnerState {
             return;
         }
 
-        if !page.rows.is_empty()
-            && let Some(session) = self.scan_sessions.get_mut(&scan_id)
-        {
-            session.resume_after_key = page.next_resume_after_key;
-        }
         self.complete_request(
             request_key,
             ok_response(
                 request_key.0.clone(),
                 request_key.1,
-                ExternalResponsePayload::ScanFetchNext(ScanFetchNextResponse {
+                ExternalResponsePayload::ScanFetchNext(ScanPageResponse {
                     rows: page.rows,
                     eof: false,
                 }),
@@ -2072,7 +1671,6 @@ impl OwnerState {
             return;
         };
         debug_assert_eq!(session.scan_id, scan_id);
-        let _ = release_snapshot_handle(&mut self.engine, &session.snapshot_handle);
         for request_key in session.queued_fetches {
             self.complete_request(
                 &request_key,
@@ -2093,7 +1691,6 @@ impl OwnerState {
             return;
         };
         debug_assert_eq!(session.scan_id, scan_id);
-        let _ = release_snapshot_handle(&mut self.engine, &session.snapshot_handle);
 
         if let Some(active_request) = session.active_fetch {
             if let Some(record) = self.requests.get(&active_request)
@@ -2141,9 +1738,9 @@ impl OwnerState {
         }
     }
 
-    fn enqueue_wal_sync_plan(&mut self, plan: WalSyncPlan) {
+    fn enqueue_wal_sync_wait(&mut self, wait: DurabilityWait) {
         self.pending_wal_sync_plans
-            .insert(plan.wal_segment_id, PendingWalSyncPlan { plan });
+            .insert(wait.target_seqno(), PendingWalSyncPlan { wait });
         self.flush_pending_wal_sync_plans();
     }
 
@@ -2153,225 +1750,29 @@ impl OwnerState {
             return;
         };
 
-        let segment_ids = self
+        let target_seqnos = self
             .pending_wal_sync_plans
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        for segment_id in segment_ids {
-            let Some(pending) = self.pending_wal_sync_plans.remove(&segment_id) else {
+        for target_seqno in target_seqnos {
+            let Some(pending) = self.pending_wal_sync_plans.remove(&target_seqno) else {
                 continue;
             };
-            match wal_sync_tx.try_send(pending.plan) {
+            match wal_sync_tx.try_send(pending.wait) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(plan)) => {
+                Err(mpsc::error::TrySendError::Full(wait)) => {
                     self.pending_wal_sync_plans
-                        .insert(segment_id, PendingWalSyncPlan { plan });
+                        .insert(target_seqno, PendingWalSyncPlan { wait });
                     break;
                 }
-                Err(mpsc::error::TrySendError::Closed(plan)) => {
+                Err(mpsc::error::TrySendError::Closed(wait)) => {
                     self.pending_wal_sync_plans
-                        .insert(segment_id, PendingWalSyncPlan { plan });
+                        .insert(target_seqno, PendingWalSyncPlan { wait });
                     self.handle_wal_sync_failure(0, "WAL sync actor is unavailable".into());
                     break;
                 }
             }
-        }
-    }
-
-    fn drive_maintenance(&mut self) {
-        // The owner reuses the direct engine's maintenance ordering: flush first, then checkpoint,
-        // then compaction, logical maintenance, and finally best-effort GC.
-        if self.lifecycle != SharedLifecycle::Ready {
-            return;
-        }
-
-        if self.active_flushes < self.config.maintenance.max_concurrent_flushes as usize
-            && let Some(plan) = self.engine.plan_flush()
-            && self.dispatch_new_maintenance(MaintenancePlan::Flush(plan))
-        {
-            return;
-        }
-
-        let checkpoint_frontier = self
-            .engine
-            .durable_current()
-            .map(|current| current.checkpoint_max_seqno)
-            .unwrap_or(0);
-        let retained_wal_bytes =
-            retained_wal_bytes_after(&self.layout, checkpoint_frontier).unwrap_or_default();
-        if self.engine.should_checkpoint(retained_wal_bytes) && !self.checkpoint_in_flight {
-            match self.engine.freeze_active_memtable_if_non_empty() {
-                Ok(true) => {
-                    self.drive_maintenance();
-                    return;
-                }
-                Ok(false) => {}
-                Err(_) => return,
-            }
-            if self.engine.current_manifest.frozen_memtables.is_empty() {
-                let capture = match self.capture_checkpoint_plan() {
-                    Ok(plan) => plan,
-                    Err(_) => return,
-                };
-                if self.dispatch_new_maintenance(MaintenancePlan::Checkpoint(capture)) {
-                    return;
-                }
-            }
-        }
-
-        if self.active_compactions < self.config.maintenance.max_concurrent_compactions as usize
-            && let Some(plan) = self.engine.plan_compaction()
-            && self.dispatch_new_maintenance(MaintenancePlan::Compact(plan))
-        {
-            return;
-        }
-
-        if !self.logical_in_flight {
-            let plan = match self.engine.plan_logical_maintenance() {
-                Ok(plan) => plan,
-                Err(_) => return,
-            };
-            if self.dispatch_new_maintenance(MaintenancePlan::Logical(plan)) {
-                return;
-            }
-        }
-
-        if !self.gc_in_flight {
-            let mut candidates = match list_canonical_data_file_ids(&self.layout) {
-                Ok(candidates) => candidates,
-                Err(_) => return,
-            };
-            let protected = match self.engine.gc_protected_file_ids() {
-                Ok(protected) => protected,
-                Err(_) => return,
-            };
-            candidates.retain(|file_id| !protected.contains(file_id));
-            if !candidates.is_empty() {
-                let _ = self.dispatch_new_maintenance(MaintenancePlan::Gc(candidates));
-            }
-        }
-    }
-
-    fn dispatch_new_maintenance(&mut self, plan: MaintenancePlan) -> bool {
-        let task_id = self.next_task_id();
-        self.task_registry.insert(
-            task_id,
-            TaskEntry::Maintenance {
-                plan: plan.clone(),
-                attempt: 0,
-            },
-        );
-        self.mark_maintenance_started(&plan);
-        if self.dispatch_maintenance_task(task_id, &plan, 0) {
-            true
-        } else {
-            self.task_registry.remove(&task_id);
-            self.clear_maintenance_flags(&plan);
-            false
-        }
-    }
-
-    fn dispatch_maintenance_task(
-        &mut self,
-        task_id: u64,
-        plan: &MaintenancePlan,
-        _attempt: u8,
-    ) -> bool {
-        let Some(worker_tx) = self.worker_tx.as_ref() else {
-            return false;
-        };
-        let payload = match plan {
-            MaintenancePlan::Flush(plan) => WorkerTaskPayload::Flush {
-                plan: plan.clone(),
-                page_size_bytes: self.config.engine.page_size_bytes,
-            },
-            MaintenancePlan::Compact(plan) => WorkerTaskPayload::Compact {
-                plan: plan.clone(),
-                page_size_bytes: self.config.engine.page_size_bytes,
-            },
-            MaintenancePlan::Logical(plan) => WorkerTaskPayload::Logical(plan.clone()),
-            MaintenancePlan::Checkpoint(plan) => WorkerTaskPayload::Checkpoint(plan.clone()),
-            MaintenancePlan::Gc(file_ids) => WorkerTaskPayload::Gc(file_ids.clone()),
-        };
-        let cancel_flag = Arc::new(AtomicBool::new(false));
-        match worker_tx.try_send(WorkerTask {
-            task_id,
-            cancel_flag,
-            payload,
-        }) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_task))
-            | Err(mpsc::error::TrySendError::Closed(_task)) => false,
-        }
-    }
-
-    fn capture_checkpoint_plan(&mut self) -> Result<CheckpointTaskPlan, Error> {
-        self.engine.enter_checkpoint_capture_pause()?;
-        let capture = self.engine.capture_metadata_checkpoint();
-        self.engine.leave_checkpoint_capture_pause();
-        Ok(CheckpointTaskPlan {
-            capture: capture?,
-            page_size_bytes: self.config.engine.page_size_bytes,
-            temp_tag: format!(
-                "checkpoint-{}-{}-{}",
-                self.engine.next_file_id, self.engine.last_committed_seqno, self.next_task_id
-            ),
-        })
-    }
-
-    fn install_checkpoint_build(&mut self, build: &CheckpointBuildResult) -> Result<(), Error> {
-        install_metadata_checkpoint(
-            &self.layout,
-            &build.temp_path,
-            build.capture.checkpoint_generation,
-        )?;
-        install_current(
-            &self.layout,
-            CurrentFile {
-                checkpoint_generation: build.capture.checkpoint_generation,
-                checkpoint_max_seqno: build.capture.checkpoint_max_seqno,
-                checkpoint_data_generation: build.capture.checkpoint_data_generation,
-            },
-            &build.temp_tag,
-        )?;
-        self.engine.install_durable_current(
-            build.capture.checkpoint_generation,
-            build.capture.checkpoint_max_seqno,
-            build.capture.checkpoint_data_generation,
-            &build.capture.levels,
-        );
-        truncate_covered_closed_wal_segments(&self.layout, build.capture.checkpoint_max_seqno)?;
-        Ok(())
-    }
-
-    fn mark_maintenance_started(&mut self, plan: &MaintenancePlan) {
-        match plan {
-            MaintenancePlan::Flush(_) => self.active_flushes += 1,
-            MaintenancePlan::Compact(_) => self.active_compactions += 1,
-            MaintenancePlan::Logical(_) => self.logical_in_flight = true,
-            MaintenancePlan::Checkpoint(_) => self.checkpoint_in_flight = true,
-            MaintenancePlan::Gc(_) => self.gc_in_flight = true,
-        }
-    }
-
-    fn finish_maintenance_task(&mut self, task_id: u64, plan: &MaintenancePlan) {
-        self.task_registry.remove(&task_id);
-        self.clear_maintenance_flags(plan);
-        self.drive_maintenance();
-    }
-
-    fn clear_maintenance_flags(&mut self, plan: &MaintenancePlan) {
-        match plan {
-            MaintenancePlan::Flush(_) => {
-                self.active_flushes = self.active_flushes.saturating_sub(1);
-            }
-            MaintenancePlan::Compact(_) => {
-                self.active_compactions = self.active_compactions.saturating_sub(1);
-            }
-            MaintenancePlan::Logical(_) => self.logical_in_flight = false,
-            MaintenancePlan::Checkpoint(_) => self.checkpoint_in_flight = false,
-            MaintenancePlan::Gc(_) => self.gc_in_flight = false,
         }
     }
 
@@ -2416,7 +1817,6 @@ fn flush_client_responses(client_state: &mut ClientState) {
 }
 
 fn spawn_worker_pool(
-    layout: StoreLayout,
     control_tx: mpsc::UnboundedSender<ControlCommand>,
     worker_parallelism: u32,
     max_worker_tasks: u32,
@@ -2427,17 +1827,15 @@ fn spawn_worker_pool(
     let mut handles = Vec::new();
     for _worker_id in 0..worker_parallelism {
         let rx = Arc::clone(&shared_rx);
-        let layout = layout.clone();
         let control_tx = control_tx.clone();
         handles.push(tokio::spawn(async move {
-            worker_loop(layout, rx, control_tx, options).await;
+            worker_loop(rx, control_tx, options).await;
         }));
     }
     (worker_tx, handles)
 }
 
 async fn worker_loop(
-    layout: StoreLayout,
     receiver: Arc<AsyncMutex<mpsc::Receiver<WorkerTask>>>,
     control_tx: mpsc::UnboundedSender<ControlCommand>,
     options: OwnerRuntimeOptions,
@@ -2452,7 +1850,7 @@ async fn worker_loop(
         };
 
         let result = match task.payload {
-            WorkerTaskPayload::Get(plan) => {
+            WorkerTaskPayload::Get(get) => {
                 if !options.get_task_delay.is_zero() {
                     tokio::time::sleep(options.get_task_delay).await;
                 }
@@ -2461,15 +1859,10 @@ async fn worker_loop(
                         "worker get task was cancelled before execution".into(),
                     )))
                 } else {
-                    let layout = layout.clone();
-                    let result = task::spawn_blocking(move || execute_point_read(&layout, &plan))
-                        .await
-                        .map_err(spawn_blocking_join_error)
-                        .and_then(|result| result);
-                    WorkerResult::Get(result)
+                    WorkerResult::Get(get.execute().await)
                 }
             }
-            WorkerTaskPayload::ScanPage(plan) => {
+            WorkerTaskPayload::ScanPage(page) => {
                 if !options.scan_task_delay.is_zero() {
                     tokio::time::sleep(options.scan_task_delay).await;
                 }
@@ -2478,86 +1871,8 @@ async fn worker_loop(
                         "worker scan task was cancelled before execution".into(),
                     )))
                 } else {
-                    let layout = layout.clone();
-                    let result =
-                        task::spawn_blocking(move || execute_scan_page_plan(&layout, &plan))
-                            .await
-                            .map_err(spawn_blocking_join_error)
-                            .and_then(|result| result);
-                    WorkerResult::ScanPage(result)
+                    WorkerResult::ScanPage(page.execute().await)
                 }
-            }
-            WorkerTaskPayload::Flush {
-                plan,
-                page_size_bytes,
-            } => {
-                let layout = layout.clone();
-                let result = task::spawn_blocking(move || {
-                    build_flush_output(&layout, page_size_bytes, &plan)
-                })
-                .await
-                .map_err(spawn_blocking_join_error)
-                .and_then(|result| result);
-                WorkerResult::Flush(result)
-            }
-            WorkerTaskPayload::Compact {
-                plan,
-                page_size_bytes,
-            } => {
-                let layout = layout.clone();
-                let result = task::spawn_blocking(move || {
-                    build_compaction_output(&layout, page_size_bytes, &plan)
-                })
-                .await
-                .map_err(spawn_blocking_join_error)
-                .and_then(|result| result);
-                WorkerResult::Compact(result)
-            }
-            WorkerTaskPayload::Logical(plan) => {
-                let layout = layout.clone();
-                let result =
-                    task::spawn_blocking(move || execute_logical_maintenance_plan(&layout, &plan))
-                        .await
-                        .map_err(spawn_blocking_join_error)
-                        .and_then(|result| result);
-                WorkerResult::Logical(result)
-            }
-            WorkerTaskPayload::Checkpoint(plan) => {
-                let layout = layout.clone();
-                let result = task::spawn_blocking(move || {
-                    let replay_seed = crate::pathivu::ReplaySeed {
-                        checkpoint_generation: plan.capture.checkpoint_generation,
-                        checkpoint_max_seqno: plan.capture.checkpoint_max_seqno,
-                        checkpoint_data_generation: plan.capture.checkpoint_data_generation,
-                        next_seqno: plan.capture.next_seqno,
-                        next_file_id: plan.capture.next_file_id,
-                        levels: plan.capture.levels.clone(),
-                        logical_shards: plan.capture.logical_shards.clone(),
-                    };
-                    let temp_path = build_temp_metadata_checkpoint_file(
-                        &layout,
-                        plan.page_size_bytes,
-                        &replay_seed,
-                        &plan.temp_tag,
-                    )?;
-                    Ok(CheckpointBuildResult {
-                        capture: plan.capture,
-                        temp_tag: plan.temp_tag,
-                        temp_path,
-                    })
-                })
-                .await
-                .map_err(spawn_blocking_join_error)
-                .and_then(|result| result);
-                WorkerResult::Checkpoint(result)
-            }
-            WorkerTaskPayload::Gc(file_ids) => {
-                let layout = layout.clone();
-                let result = task::spawn_blocking(move || Ok(execute_gc(&layout, &file_ids)))
-                    .await
-                    .map_err(spawn_blocking_join_error)
-                    .and_then(|result: Result<Vec<u64>, Error>| result);
-                WorkerResult::Gc(result)
             }
         };
 
@@ -2569,43 +1884,35 @@ async fn worker_loop(
 }
 
 async fn wal_sync_actor(
-    mut receiver: mpsc::Receiver<WalSyncPlan>,
+    mut receiver: mpsc::Receiver<DurabilityWait>,
     control_tx: mpsc::UnboundedSender<ControlCommand>,
-    group_commit_bytes: u64,
     group_commit_max_delay: Duration,
     extra_delay: Duration,
 ) {
-    let mut pending = BTreeMap::<u64, WalSyncPendingEntry>::new();
-    let mut last_synced_offsets = BTreeMap::<u64, u64>::new();
+    let mut pending = BTreeMap::<u64, (DurabilityWait, Instant)>::new();
 
     loop {
+        if pending.is_empty() {
+            let Some(wait) = receiver.recv().await else {
+                break;
+            };
+            pending.insert(wait.target_seqno(), (wait, Instant::now()));
+        }
+
         let deadline = pending
             .values()
-            .map(|entry| entry.oldest_requested_at + group_commit_max_delay)
+            .map(|(_wait, requested_at)| *requested_at + group_commit_max_delay)
             .min();
 
         tokio::select! {
-            maybe_plan = receiver.recv() => {
-                let Some(plan) = maybe_plan else {
-                    break;
-                };
-                let now = Instant::now();
-                match pending.entry(plan.wal_segment_id) {
-                    std::collections::btree_map::Entry::Occupied(mut entry) => {
-                        let oldest = entry.get().oldest_requested_at.min(now);
-                        if plan.durable_seqno_target >= entry.get().plan.durable_seqno_target {
-                            entry.insert(WalSyncPendingEntry {
-                                plan,
-                                oldest_requested_at: oldest,
-                            });
-                        }
-                    }
-                    std::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(WalSyncPendingEntry {
-                            plan,
-                            oldest_requested_at: now,
-                        });
-                    }
+            maybe_wait = receiver.recv() => {
+                if let Some(wait) = maybe_wait {
+                    let target_seqno = wait.target_seqno();
+                    let requested_at = pending
+                        .get(&target_seqno)
+                        .map(|(_wait, requested_at)| *requested_at)
+                        .unwrap_or_else(Instant::now);
+                    pending.insert(target_seqno, (wait, requested_at));
                 }
             }
             _ = async {
@@ -2615,44 +1922,30 @@ async fn wal_sync_actor(
             }, if deadline.is_some() => {}
         }
 
-        loop {
-            let due_segment = pending.iter().find_map(|(segment_id, entry)| {
-                let last_synced = last_synced_offsets.get(segment_id).copied().unwrap_or(0);
-                let bytes_since_sync = entry.plan.durable_offset_target.saturating_sub(last_synced);
-                if bytes_since_sync >= group_commit_bytes
-                    || entry.oldest_requested_at + group_commit_max_delay <= Instant::now()
-                {
-                    Some(*segment_id)
-                } else {
-                    None
-                }
-            });
-            let Some(segment_id) = due_segment else {
-                break;
-            };
-            let Some(entry) = pending.remove(&segment_id) else {
-                continue;
-            };
-            let target_seqno = entry.plan.durable_seqno_target;
-            if !extra_delay.is_zero() {
-                tokio::time::sleep(extra_delay).await;
+        let Some((lowest_target, (_wait, requested_at))) = pending.first_key_value() else {
+            continue;
+        };
+        if *requested_at + group_commit_max_delay > Instant::now() && !receiver.is_closed() {
+            let _ = lowest_target;
+            continue;
+        }
+
+        let Some((target_seqno, (wait, _requested_at))) = pending.pop_last() else {
+            continue;
+        };
+        pending.clear();
+        if !extra_delay.is_zero() {
+            tokio::time::sleep(extra_delay).await;
+        }
+        match wait.wait().await {
+            Ok(()) => {
+                let _ = control_tx.send(ControlCommand::WalSyncSucceeded(target_seqno));
             }
-            match task::spawn_blocking(move || execute_wal_sync_plan(entry.plan))
-                .await
-                .map_err(spawn_blocking_join_error)
-                .and_then(|result| result)
-            {
-                Ok(result) => {
-                    last_synced_offsets
-                        .insert(result.wal_segment_id, result.durable_offset_reached);
-                    let _ = control_tx.send(ControlCommand::WalSyncSucceeded(result));
-                }
-                Err(error) => {
-                    let _ = control_tx.send(ControlCommand::WalSyncFailed {
-                        target_seqno,
-                        message: error.to_string(),
-                    });
-                }
+            Err(error) => {
+                let _ = control_tx.send(ControlCommand::WalSyncFailed {
+                    target_seqno,
+                    message: error.to_string(),
+                });
             }
         }
     }
@@ -2668,26 +1961,6 @@ async fn scan_expiry_tick(control_tx: mpsc::UnboundedSender<ControlCommand>) {
         {
             break;
         }
-    }
-}
-
-fn spawn_retry_timer(
-    control_tx: mpsc::UnboundedSender<ControlCommand>,
-    task_id: u64,
-    delay: Duration,
-) {
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        let _ = control_tx.send(ControlCommand::RetryMaintenance { task_id });
-    });
-}
-
-fn maintenance_retry_delay(attempt: u8) -> Option<Duration> {
-    match attempt {
-        0 => Some(Duration::from_millis(50)),
-        1 => Some(Duration::from_millis(200)),
-        2 => Some(Duration::from_secs(1)),
-        _ => None,
     }
 }
 
@@ -2899,6 +2172,7 @@ mod tests {
 
     use super::*;
     use crate::pathivu::WalWriterTestOptions;
+    use crate::{Bound, ScanPageLimits, ScanRange};
 
     static NEXT_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -3062,7 +2336,10 @@ memtable_flush_bytes = 16384
         harness
             .wait_for(
                 |owner| {
-                    collect_stats_response(&owner.engine)
+                    owner
+                        .engine
+                        .current_stats()
+                        .expect("stats should succeed in tests")
                         .levels
                         .iter()
                         .any(|level| level.file_count > 0)
@@ -3117,10 +2394,11 @@ memtable_flush_bytes = 16384
             3,
             Some("scan-start"),
             ExternalMethod::ScanStart(ScanStartRequest {
-                start_bound: Bound::NegInf,
-                end_bound: Bound::PosInf,
-                max_records_per_page: 4,
-                max_bytes_per_page: 4096,
+                range: ScanRange::new(Bound::NegInf, Bound::PosInf).unwrap(),
+                page_limits: ScanPageLimits {
+                    max_records_per_page: 4,
+                    max_bytes_per_page: 4096,
+                },
             }),
         ));
         let start_response = harness.recv(start).await;
@@ -3192,7 +2470,10 @@ memtable_flush_bytes = 16384
         harness
             .wait_for(
                 |owner| {
-                    collect_stats_response(&owner.engine)
+                    owner
+                        .engine
+                        .current_stats()
+                        .expect("stats should succeed in tests")
                         .levels
                         .iter()
                         .any(|level| level.file_count > 0)
@@ -3206,10 +2487,11 @@ memtable_flush_bytes = 16384
             1,
             Some("scan-start"),
             ExternalMethod::ScanStart(ScanStartRequest {
-                start_bound: Bound::NegInf,
-                end_bound: Bound::PosInf,
-                max_records_per_page: 1,
-                max_bytes_per_page: 8192,
+                range: ScanRange::new(Bound::NegInf, Bound::PosInf).unwrap(),
+                page_limits: ScanPageLimits {
+                    max_records_per_page: 1,
+                    max_bytes_per_page: 8192,
+                },
             }),
         ));
         let start_response = harness.recv(start).await;
@@ -3290,7 +2572,10 @@ memtable_flush_bytes = 16384
         harness
             .wait_for(
                 |owner| {
-                    collect_stats_response(&owner.engine)
+                    owner
+                        .engine
+                        .current_stats()
+                        .expect("stats should succeed in tests")
                         .levels
                         .iter()
                         .any(|level| level.file_count > 0)
@@ -3304,10 +2589,11 @@ memtable_flush_bytes = 16384
             1,
             Some("scan-start"),
             ExternalMethod::ScanStart(ScanStartRequest {
-                start_bound: Bound::NegInf,
-                end_bound: Bound::PosInf,
-                max_records_per_page: 1,
-                max_bytes_per_page: 8192,
+                range: ScanRange::new(Bound::NegInf, Bound::PosInf).unwrap(),
+                page_limits: ScanPageLimits {
+                    max_records_per_page: 1,
+                    max_bytes_per_page: 8192,
+                },
             }),
         ));
         let scan_id = match harness.recv(start).await.payload {
@@ -3364,23 +2650,17 @@ memtable_flush_bytes = 16384
             1,
             Some("scan-start"),
             ExternalMethod::ScanStart(ScanStartRequest {
-                start_bound: Bound::NegInf,
-                end_bound: Bound::PosInf,
-                max_records_per_page: 1,
-                max_bytes_per_page: 1024,
+                range: ScanRange::new(Bound::NegInf, Bound::PosInf).unwrap(),
+                page_limits: ScanPageLimits {
+                    max_records_per_page: 1,
+                    max_bytes_per_page: 1024,
+                },
             }),
         ));
         let scan_id = match harness.recv(start).await.payload {
             Some(ExternalResponsePayload::ScanStart(payload)) => payload.scan_id,
             other => panic!("unexpected payload: {other:?}"),
         };
-        let snapshot_handle = harness
-            .owner
-            .scan_sessions
-            .get(&scan_id)
-            .expect("scan session should exist")
-            .snapshot_handle
-            .clone();
 
         harness
             .owner
@@ -3390,10 +2670,6 @@ memtable_flush_bytes = 16384
             .expires_at = Instant::now();
         harness.owner.expire_idle_sessions();
         assert!(harness.owner.scan_sessions.is_empty());
-        assert!(matches!(
-            release_snapshot_handle(&mut harness.owner.engine, &snapshot_handle),
-            Err(Error::InvalidArgument(_))
-        ));
 
         let fetch = harness.submit(test_request(
             "client-a",
@@ -3571,7 +2847,7 @@ max_waiting_durability_waiters = 1
     ) -> TestOwner {
         let config_path = write_test_config(extra_config);
         let config = load_runtime_config(&config_path).unwrap();
-        let opened = open_engine_runtime(&config_path, config.clone(), options.engine).unwrap();
+        let engine = PezhaiEngine::open_with_options(&config_path, options.engine).unwrap();
         let (external_tx, _external_rx) =
             mpsc::channel(config.server_limits.max_pending_requests as usize);
         let (control_tx, control_rx) = mpsc::unbounded_channel();
@@ -3583,7 +2859,6 @@ max_waiting_durability_waiters = 1
         shared.set_lifecycle(SharedLifecycle::Ready);
 
         let (worker_tx, worker_handles) = spawn_worker_pool(
-            opened.layout.clone(),
             control_tx.clone(),
             config.server_limits.worker_parallelism,
             config.server_limits.max_worker_tasks,
@@ -3594,7 +2869,6 @@ max_waiting_durability_waiters = 1
         let wal_sync_handle = tokio::spawn(wal_sync_actor(
             wal_sync_rx,
             control_tx.clone(),
-            config.wal.group_commit_bytes,
             Duration::from_millis(config.wal.group_commit_max_delay_ms),
             options.wal_sync_delay,
         ));
@@ -3605,9 +2879,8 @@ max_waiting_durability_waiters = 1
                 config_path: config_path.clone(),
             },
             config,
-            opened,
+            engine,
             shared,
-            control_tx,
             worker_tx,
             wal_sync_tx,
             worker_handles,

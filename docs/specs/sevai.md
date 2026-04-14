@@ -255,6 +255,9 @@ Worker actors:
   apply ordering, cancellation, and backpressure policy around the decision, but it MUST NOT
   duplicate snapshot validation, active-memtable fast-path selection, immutable-source capture, or
   WAL waiter registration outside the engine [BEHAVIORAL]
+- in the Rust implementation, those storage decisions are realized through the
+  public `pezhai::*` engine API rather than through crate-private engine state
+  or duplicate server-owned storage helpers [BEHAVIORAL]
 - WAL wake handling, write-durability waiter release, maintenance polling/capture, maintenance
   result publication validation, worker read completion re-entry, and shutdown acknowledgement
   MUST all route through that same engine shell rather than through separate server-only storage
@@ -711,6 +714,12 @@ ScanStartRequest {
 }
 ```
 
+Rust binding note:
+
+- the Rust `pezhai::sevai::ScanStartRequest` groups the same fields as
+  `range: ScanRange` plus `page_limits: ScanPageLimits`; this is a binding-only
+  packaging choice and MUST preserve the request semantics above [BEHAVIORAL]
+
 Response:
 
 ```text
@@ -759,6 +768,11 @@ ScanFetchNextResponse {
     eof: bool
 }
 ```
+
+Rust binding note:
+
+- the Rust implementation reuses the engine-owned `ScanPageResponse` as the
+  success payload for `ScanFetchNext` [BEHAVIORAL]
 
 Rules:
 

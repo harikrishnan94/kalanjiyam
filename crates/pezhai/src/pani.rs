@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::Error;
 use crate::idam::StoreLayout;
-use crate::iyakkam::SnapshotHandle;
+use crate::iyakkam::{Bound, ScanRow, SnapshotHandle};
 use crate::nilaimai::{
     CompactionBuildResult, CompactionPlan, FlushBuildResult, FlushPlan, InternalRecord,
     LogicalMaintenancePlan, LogicalShardEntry, LogicalShardInstallPayload, MemtableRef,
@@ -14,7 +14,6 @@ use crate::nilaimai::{
 use crate::pathivu::{
     build_temp_data_file, find_visible_record_in_data_file, load_data_file_records,
 };
-use crate::sevai::{Bound, ScanRow};
 
 static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -155,8 +154,8 @@ pub(crate) fn build_flush_output(
 ) -> Result<FlushBuildResult, Error> {
     let records = collect_memtable_records(
         &plan.source.memtable,
-        &crate::sevai::Bound::NegInf,
-        &crate::sevai::Bound::PosInf,
+        &crate::Bound::NegInf,
+        &crate::Bound::PosInf,
     )?;
     let temp_path = layout.temp_data_file_path(&format!(
         "{}-{}",
@@ -178,8 +177,8 @@ pub(crate) fn build_compaction_output(
         records.extend(load_data_file_records(
             layout,
             input,
-            &crate::sevai::Bound::NegInf,
-            &crate::sevai::Bound::PosInf,
+            &crate::Bound::NegInf,
+            &crate::Bound::PosInf,
         )?);
     }
 
@@ -284,8 +283,8 @@ pub(crate) fn execute_gc(layout: &StoreLayout, file_ids: &[u64]) -> Vec<u64> {
 
 fn collect_memtable_records(
     memtable: &MemtableRef,
-    start_bound: &crate::sevai::Bound,
-    end_bound: &crate::sevai::Bound,
+    start_bound: &crate::Bound,
+    end_bound: &crate::Bound,
 ) -> Result<Vec<InternalRecord>, Error> {
     Ok(lock_memtable(memtable)?.collect_internal_records(start_bound, end_bound))
 }

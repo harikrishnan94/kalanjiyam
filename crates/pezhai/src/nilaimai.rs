@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::config::{RuntimeConfig, SyncMode};
 use crate::error::Error;
-use crate::sevai::{Bound, LevelStats, LogicalShardStats, ScanRow};
+use crate::iyakkam::{Bound, LevelStats, LogicalShardStats, ScanRow};
 
 /// One visible or tombstoned version for one user key.
 #[derive(Clone, Debug, PartialEq, Eq)]

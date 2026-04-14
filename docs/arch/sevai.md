@@ -1,16 +1,16 @@
 # Pezhai Server Architecture
 
 This document records the milestone-5 runtime architecture for `pezhai::sevai`
-and the `pezhai-sevai` TCP/protobuf binary. The server now embeds the
-persistent engine directly inside the owner actor, reuses the engine helpers
-from `iyakkam`, `pathivu`, and `pani`, and adds durable worker, scan, and
-maintenance orchestration that the milestone-5 spec requires.
+and the `pezhai-sevai` TCP/protobuf binary. The server now owns one
+`PezhaiEngine` handle and routes storage behavior only through the public
+engine API plus public engine-owned handles such as `DeferredGet`, `PagedScan`,
+and `DurabilityWait`.
 
 ### Package responsibilities
 
 - `crates/pezhai/src/sevai.rs` owns the public server handle, owner actor
-  task, lifecycle state machine, cancellation index, reader stats, WAL sync,
-  maintenance state, and the transport-agnostic request and response types.
+  task, lifecycle state machine, cancellation index, read-task orchestration,
+  WAL-wait batching, and the transport-agnostic request and response types.
 - `crates/pezhai-sevai/src/adapter.rs` owns configuration loading, framing,
   protobuf encoding/decoding, cancel-token synthesis, disconnect detection,
   and mapping wire requests to `ExternalRequest` plus the matching response.
@@ -21,26 +21,22 @@ maintenance orchestration that the milestone-5 spec requires.
 ### Lifecycle and owner state
 
 The owner actor implements the Booting -> Ready -> Stopping -> Stopped state
-machine defined by the spec. Booting opens the engine, WAL, store layout, and
-the owner-owned WAL append state, and only after that initialization completes
-does the actor mark itself Ready and accept RPCs.
+machine defined by the spec. Booting opens one `PezhaiEngine` from the shared
+config file and only after that initialization completes does the actor mark
+itself Ready and accept RPCs.
 
 Owner-held mutable state includes:
 
-- Embedded `EngineState` plus the persisted `StoreLayout` references.
-- `OwnerWalAppendState` with seqno allocator, active WAL segment cursor, active
-  memtable owner, bytes-on-disk cursor, and durable frontier coverage data.
+- One owned `PezhaiEngine` handle.
 - Lifecycle flags plus a write-admission stop flag that keeps reads alive while
   blocking new writes after fatal WAL or sync failures.
 - Per-client ordering tables that guarantee replies exit in `request_id`
   sequence and scan-specific FIFOs that keep each `scan_id` ordered.
 - The cancellation index keyed by `(client_id, effective_cancel_token)`.
 - Scan session table with queued fetch FIFOs, active fetch task id, in-flight
-  scan-page counter, expiry deadlines, and pinned snapshots.
+  scan-page counter, expiry deadlines, and one owned `PagedScan` per session.
 - Durability waiter registry keyed by target durable seqno plus cancel token.
-- Bounded worker queue counters and maintenance retry/backoff state.
-- Maintenance in-flight indicators so only one checkpoint, one logical task, one
-  GC task, and the configured number of flush/compaction tasks run at once.
+- Bounded worker queue counters for deferred reads and scan pages.
 
 ### Communication topology
 
@@ -51,60 +47,43 @@ lacks one, enforces per-client ordering and worker limits, and returns `Busy`
 before mutating visible state when the queue is full. Closed or canceled
 channels keep returning `Err(ServerUnavailable)`.
 
-All other control traffic — cancel requests, shutdown, worker completions, WAL
-sync completions, maintenance results, retry timers, and scan expiry ticks —
-arrives on an unbounded `control_tx`. The owner loop always biases
-`tokio::select!` toward control traffic so cancel and shutdown work even when
-the external queue is saturated.
+All other control traffic — cancel requests, shutdown, deferred-read
+completions, WAL sync completions, and scan expiry ticks — arrives on an
+unbounded `control_tx`. The owner loop always biases `tokio::select!` toward
+control traffic so cancel and shutdown work even when the external queue is
+saturated.
 
 ### Worker pool
 
 A bounded `mpsc::channel(server_limits.max_worker_tasks)` feeds
 `server_limits.worker_parallelism` Tokio worker tasks. Workers execute point
-reads, scan pages, and maintenance work by invoking the shared blocking helpers
-in `pani`. They remain stateless and call `spawn_blocking` only for pure
-filesystem work such as data file reads, checkpoint builds, and GC deletes.
-The owner actor orchestrates admission, cancellation, backpressure, and stats
-publication.
+reads and scan pages by awaiting public engine handles returned from
+`prepare_latest_get()` and `PagedScan::prepare_next_page()`. They remain
+stateless and the owner actor still owns admission, cancellation, backpressure,
+and response publication.
 
 ### WAL sync actor
 
 The WAL sync actor is a separate Tokio task with its own bounded channel for
-immutable `WalSyncPlan`s. Each plan references bytes that are already appended,
-the active segment identity (using its first seqno as the segment id), the
-target durable seqno, and an indicator of whether the current durable frontier
-already covers the writes. The actor coalesces plans for the same segment,
-flushes when `wal.group_commit_bytes` is reached or when the oldest pending plan
-exceeds `wal.group_commit_max_delay_ms`, and then reports success or failure
-back to the owner.
+public `DurabilityWait` handles returned by prepared writes. The actor batches
+pending waits until `wal.group_commit_max_delay_ms` expires, executes only the
+highest target in the batch, and reports success or failure back to the owner.
 
-Success updates the durable frontier; failure sets the owner write-stop flag,
-fails impacted waiters with retryable `IO`, and stops new writes until the
-owner restarts the pipeline. The WAL sync actor never mutates seqno allocation,
-append cursor ownership, or waiter tables; it merely fsyncs bytes that the
-owner already owns.
+Success releases every waiter whose target is covered by that durable frontier.
+Failure fails the impacted waiters with retryable `IO`; the underlying engine
+marks itself write-stopped so later writes stay blocked until reopen.
 
 ### Scan sessions and pagination
 
-Scan helpers reuse the engine-shared snapshot capture and plan-building code in
-`iyakkam`. `ScanStart` validation enforces `max_scan_sessions`, builds a
-pinned snapshot, allocates a `scan_id`, and creates a `ScanSession` that tracks
-the requested range, pagination limits, resume key, snapshot handle, queued
-fetches, expiry timestamp, and the data generation that was pinned.
+`ScanStart` validation enforces `max_scan_sessions`, allocates a `scan_id`, and
+creates a `ScanSession` around one public `PagedScan` handle plus the queued
+fetch FIFO and expiry deadline.
 
-`ScanFetchNext` either answers inline when the active memtable can satisfy the
-page or captures one `ScanPagePlan` and dispatches a worker. The owner allows
-at most `server_limits.max_in_flight_scan_tasks` concurrent page workers; the
-remaining fetches stay queued inside the session FIFO even across connections,
-and attempts to exceed `server_limits.max_scan_fetch_queue_per_session`
-return `Busy` before admission. On each non-EOF page, the owner updates
-`resume_after_key` before starting the next queued fetch.
-
-EOF tears down the session, releases the snapshot, and fails any queued
-follow-ups with `InvalidArgument`. Expiry runs on a 1-second sweep tick: expired
-sessions drop snapshots, fail in-flight and queued fetches with `Cancelled
-(retryable)`, and clear the queues. Shutdown uses the same cleanup path so
-long-lived snapshots never survive owner termination.
+`ScanFetchNext` asks that `PagedScan` for the next engine decision. Inline
+pages complete immediately, deferred pages are executed by the worker pool, and
+same-scan FIFO ordering remains owner-enforced across clients. EOF drops the
+session, which drops the underlying `PagedScan` and releases its pinned
+snapshot. Expiry and shutdown use the same cleanup path.
 
 ### Cancellation index and disconnect handling
 

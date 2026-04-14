@@ -8,12 +8,12 @@ use std::path::{Path, PathBuf};
 use crate::config::SyncMode;
 use crate::error::Error;
 use crate::idam::StoreLayout;
+use crate::iyakkam::Bound;
 use crate::nilaimai::{
     BuiltDataFileSummary, CompactPublishPayload, FileMeta, FlushPublishPayload, InternalRecord,
     LogicalShardEntry, LogicalShardInstallPayload, ManifestLevelView, Mutation, RecordKind,
     compare_internal, compare_internal_to_parts, key_in_range,
 };
-use crate::sevai::Bound;
 
 /// Maximum accepted key size for public engine and server operations.
 pub(crate) const MAX_KEY_BYTES: usize = 1024;
@@ -607,6 +607,7 @@ impl WalWriter {
     }
 
     /// Synchronizes the current active segment and returns the durable frontier it now covers.
+    #[cfg(test)]
     pub(crate) fn sync_to_current_frontier(&mut self, target_seqno: u64) -> Result<u64, Error> {
         let Some(plan) = self.append_state.current_sync_plan(target_seqno)? else {
             return Ok(target_seqno);
@@ -3036,12 +3037,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::Bound;
     use crate::idam::StoreLayout;
     use crate::nilaimai::{
         CompactPublishPayload, FileMeta, FlushPublishPayload, InternalRecord, LogicalShardEntry,
         ManifestLevelView, Mutation, RecordKind,
     };
-    use crate::sevai::Bound;
 
     use super::{
         CurrentFile, ReplaySeed, SyncMode, WalWriter, WalWriterTestOptions, build_current_bytes,
