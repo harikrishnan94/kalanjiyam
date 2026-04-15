@@ -643,6 +643,7 @@ impl PezhaiServer {
             control_tx.clone(),
             Duration::from_millis(config.wal.group_commit_max_delay_ms),
             options.wal_sync_delay,
+            config.wal.group_commit_bytes,
         ));
         let expiry_handle = tokio::spawn(scan_expiry_tick(control_tx.clone()));
 
@@ -1888,8 +1889,10 @@ async fn wal_sync_actor(
     control_tx: mpsc::UnboundedSender<ControlCommand>,
     group_commit_max_delay: Duration,
     extra_delay: Duration,
+    group_commit_bytes: u64,
 ) {
     let mut pending = BTreeMap::<u64, (DurabilityWait, Instant)>::new();
+    let mut last_durable_offset = 0_u64;
 
     loop {
         if pending.is_empty() {
@@ -1899,10 +1902,48 @@ async fn wal_sync_actor(
             pending.insert(wait.target_seqno(), (wait, Instant::now()));
         }
 
-        let deadline = pending
+        let oldest_requested_at = pending
             .values()
             .map(|(_wait, requested_at)| *requested_at + group_commit_max_delay)
-            .min();
+            .min()
+            .expect("pending WAL waiters should have at least one deadline")
+            - group_commit_max_delay;
+        let highest_offset = pending
+            .last_key_value()
+            .map(|(_target_seqno, (wait, _requested_at))| wait.durable_offset_target())
+            .expect("pending WAL waiters should have at least one offset");
+        // WAL offsets can reset when a new segment becomes active, so treat that
+        // transition as immediately eligible for a flush instead of waiting for
+        // the max-delay path to discover it later.
+        let pending_bytes = if highest_offset >= last_durable_offset {
+            highest_offset - last_durable_offset
+        } else {
+            group_commit_bytes
+        };
+        let delay_elapsed = oldest_requested_at + group_commit_max_delay <= Instant::now();
+        if pending_bytes >= group_commit_bytes || delay_elapsed || receiver.is_closed() {
+            let Some((target_seqno, (wait, _requested_at))) = pending.pop_last() else {
+                continue;
+            };
+            pending.clear();
+            if !extra_delay.is_zero() {
+                tokio::time::sleep(extra_delay).await;
+            }
+            let durable_offset_target = wait.durable_offset_target();
+            match wait.wait().await {
+                Ok(()) => {
+                    last_durable_offset = durable_offset_target;
+                    let _ = control_tx.send(ControlCommand::WalSyncSucceeded(target_seqno));
+                }
+                Err(error) => {
+                    let _ = control_tx.send(ControlCommand::WalSyncFailed {
+                        target_seqno,
+                        message: error.to_string(),
+                    });
+                }
+            }
+            continue;
+        }
 
         tokio::select! {
             maybe_wait = receiver.recv() => {
@@ -1916,37 +1957,8 @@ async fn wal_sync_actor(
                 }
             }
             _ = async {
-                if let Some(deadline) = deadline {
-                    tokio::time::sleep_until(deadline).await;
-                }
-            }, if deadline.is_some() => {}
-        }
-
-        let Some((lowest_target, (_wait, requested_at))) = pending.first_key_value() else {
-            continue;
-        };
-        if *requested_at + group_commit_max_delay > Instant::now() && !receiver.is_closed() {
-            let _ = lowest_target;
-            continue;
-        }
-
-        let Some((target_seqno, (wait, _requested_at))) = pending.pop_last() else {
-            continue;
-        };
-        pending.clear();
-        if !extra_delay.is_zero() {
-            tokio::time::sleep(extra_delay).await;
-        }
-        match wait.wait().await {
-            Ok(()) => {
-                let _ = control_tx.send(ControlCommand::WalSyncSucceeded(target_seqno));
-            }
-            Err(error) => {
-                let _ = control_tx.send(ControlCommand::WalSyncFailed {
-                    target_seqno,
-                    message: error.to_string(),
-                });
-            }
+                tokio::time::sleep_until(oldest_requested_at + group_commit_max_delay).await;
+            } => {}
         }
     }
 }
@@ -2168,9 +2180,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
+    use crate::pani::{reset_scan_stream_build_count, scan_stream_build_count};
     use crate::pathivu::WalWriterTestOptions;
     use crate::{Bound, ScanPageLimits, ScanRange};
 
@@ -2439,6 +2452,108 @@ memtable_flush_bytes = 16384
     }
 
     #[tokio::test]
+    async fn file_backed_scan_fetches_reuse_one_stream_cursor() {
+        let mut harness = build_test_owner(
+            Some(
+                r#"
+[lsm]
+memtable_flush_bytes = 16384
+l0_file_threshold = 2
+"#,
+            ),
+            OwnerRuntimeOptions {
+                engine: EngineTestOptions {
+                    logical_maintenance_interval: Duration::from_secs(60),
+                    ..EngineTestOptions::default()
+                },
+                ..OwnerRuntimeOptions::default()
+            },
+        )
+        .await;
+
+        for (request_id, key, fill) in [(1, b"ant".as_slice(), b'a'), (2, b"bee".as_slice(), b'b')]
+        {
+            let put = harness.submit(test_request(
+                "scanner",
+                request_id,
+                Some("put"),
+                ExternalMethod::Put(PutRequest {
+                    key: key.to_vec(),
+                    value: big_value(fill),
+                }),
+            ));
+            assert_eq!(harness.recv(put).await.status.code, StatusCode::Ok);
+        }
+
+        harness
+            .wait_for(
+                |owner| {
+                    owner
+                        .engine
+                        .current_stats()
+                        .expect("stats should succeed in tests")
+                        .levels
+                        .iter()
+                        .any(|level| level.file_count > 0)
+                },
+                "flush completion",
+            )
+            .await;
+
+        reset_scan_stream_build_count();
+        let start = harness.submit(test_request(
+            "scanner",
+            3,
+            Some("scan-start"),
+            ExternalMethod::ScanStart(ScanStartRequest {
+                range: ScanRange::new(Bound::NegInf, Bound::PosInf).unwrap(),
+                page_limits: ScanPageLimits {
+                    max_records_per_page: 1,
+                    max_bytes_per_page: 16384,
+                },
+            }),
+        ));
+        let scan_id = match harness.recv(start).await.payload {
+            Some(ExternalResponsePayload::ScanStart(payload)) => payload.scan_id,
+            other => panic!("unexpected payload: {other:?}"),
+        };
+
+        let first_fetch = harness.submit(test_request(
+            "scanner",
+            4,
+            Some("scan-fetch-1"),
+            ExternalMethod::ScanFetchNext(ScanFetchNextRequest { scan_id }),
+        ));
+        match harness.recv(first_fetch).await.payload {
+            Some(ExternalResponsePayload::ScanFetchNext(payload)) => {
+                assert_eq!(payload.rows.len(), 1);
+                assert!(!payload.eof);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        let builds_after_first_fetch = scan_stream_build_count();
+        assert!(builds_after_first_fetch >= 1);
+
+        let second_fetch = harness.submit(test_request(
+            "scanner",
+            5,
+            Some("scan-fetch-2"),
+            ExternalMethod::ScanFetchNext(ScanFetchNextRequest { scan_id }),
+        ));
+        match harness.recv(second_fetch).await.payload {
+            Some(ExternalResponsePayload::ScanFetchNext(payload)) => {
+                assert_eq!(payload.rows.len(), 1);
+                assert!(payload.eof);
+            }
+            other => panic!("unexpected payload: {other:?}"),
+        }
+        assert_eq!(scan_stream_build_count(), builds_after_first_fetch);
+        assert!(harness.owner.scan_sessions.is_empty());
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn same_scan_fetch_requests_complete_fifo_across_clients() {
         let mut harness = build_test_owner(
             Some(
@@ -2686,19 +2801,21 @@ memtable_flush_bytes = 16384
     }
 
     #[tokio::test]
-    async fn one_wal_sync_batch_satisfies_multiple_waiters() {
+    async fn group_commit_bytes_flush_before_max_delay() {
         let mut harness = build_test_owner(
             Some(
                 r#"
 [wal]
-group_commit_max_delay_ms = 20
+group_commit_bytes = 1
+group_commit_max_delay_ms = 1000
 "#,
             ),
             OwnerRuntimeOptions::default(),
         )
         .await;
 
-        let put_a = harness.submit(test_request(
+        let started = Instant::now();
+        let put = harness.submit(test_request(
             "client-a",
             1,
             Some("put-a"),
@@ -2707,21 +2824,42 @@ group_commit_max_delay_ms = 20
                 value: b"a".to_vec(),
             }),
         ));
-        let put_b = harness.submit(test_request(
-            "client-b",
+
+        let (response, syncs) = harness.recv_with_sync_count(put).await;
+        assert_eq!(response.status.code, StatusCode::Ok);
+        assert_eq!(syncs, 1);
+        assert!(started.elapsed() < Duration::from_millis(400));
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn max_delay_still_flushes_when_bytes_do_not_trigger() {
+        let mut harness = build_test_owner(
+            Some(
+                r#"
+[wal]
+group_commit_bytes = 1048576
+group_commit_max_delay_ms = 20
+"#,
+            ),
+            OwnerRuntimeOptions::default(),
+        )
+        .await;
+
+        let put = harness.submit(test_request(
+            "client-a",
             1,
-            Some("put-b"),
+            Some("put-a"),
             ExternalMethod::Put(PutRequest {
-                key: b"bee".to_vec(),
-                value: b"b".to_vec(),
+                key: b"ant".to_vec(),
+                value: b"a".to_vec(),
             }),
         ));
 
-        let (response_a, syncs_a) = harness.recv_with_sync_count(put_a).await;
-        let (response_b, syncs_b) = harness.recv_with_sync_count(put_b).await;
-        assert_eq!(response_a.status.code, StatusCode::Ok);
-        assert_eq!(response_b.status.code, StatusCode::Ok);
-        assert_eq!(syncs_a + syncs_b, 1);
+        let (response, syncs) = harness.recv_with_sync_count(put).await;
+        assert_eq!(response.status.code, StatusCode::Ok);
+        assert_eq!(syncs, 1);
 
         harness.shutdown().await;
     }
@@ -2790,6 +2928,7 @@ max_waiting_durability_waiters = 1
                         fail_at_seqno: None,
                         fail_sync_at_seqno: Some(1),
                     },
+                    ..EngineTestOptions::default()
                 },
                 ..OwnerRuntimeOptions::default()
             },
@@ -2871,6 +3010,7 @@ max_waiting_durability_waiters = 1
             control_tx.clone(),
             Duration::from_millis(config.wal.group_commit_max_delay_ms),
             options.wal_sync_delay,
+            config.wal.group_commit_bytes,
         ));
         let expiry_handle = tokio::spawn(scan_expiry_tick(control_tx.clone()));
 

@@ -168,6 +168,16 @@ Logical-shard installs follow a simpler boundary:
 4. append one `LogicalShardInstall` WAL record
 5. replace the current logical-shard source entry set atomically in memory
 
+### Logical maintenance cadence
+
+`run_maintenance_cycle` still captures the scan plan inside the worker, but a
+dedicated engine timer now emits the logical-maintenance tick once per second
+instead of on every `DurabilityWait`. Flush, compaction, checkpoint, and GC work
+remain on the per-write tick path, while the heavier logical-shard recomputation
+runs only when the timer fires. Live-byte stats therefore lag the durable
+frontier by at most one second while avoiding full-keyspace scans after every
+per-write WAL sync.
+
 Checkpoint install follows the spec's capture ordering:
 
 1. freeze the active memtable if it still contains committed records
@@ -215,9 +225,22 @@ Point reads probe sources in this order:
 3. matching L0 files in descending `file_id`
 4. at most one matching file per higher level
 
+Each manifest generation now owns one decoded-file cache for its published
+shared-data files. Point reads and scan planning reuse those decoded records
+within the pinned generation instead of reparsing the same `.kjm` file on every
+request. When flush or compaction publishes the next generation, that new
+generation starts with its own cache, while snapshot-pinned older generations
+keep their previously decoded files alive until the snapshot is released.
+
 Scans capture the pinned manifest generation, collect overlapping sources, and
 merge internal records by full internal-key order before suppressing shadowed
 versions and tombstones for the pinned `snapshot_seqno`.
+
+Paged scans no longer rebuild that merged row set for every fetch. The first
+page builds one retained per-source cursor set from the pinned memtables and
+decoded files, and later `ScanFetchNext` calls advance that cursor state
+incrementally until EOF. EOF and scan-session cleanup drop the retained cursor
+state together with the pinned snapshot.
 
 ### Recovery model
 

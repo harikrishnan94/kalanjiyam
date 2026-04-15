@@ -4,8 +4,8 @@ use std::fs::{self, File};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::thread::JoinHandle;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::oneshot;
 use tokio::task;
@@ -19,7 +19,7 @@ use crate::nilaimai::{
     MemtableRef, Mutation, PointReadPlan,
 };
 use crate::pani::{
-    ScanPagePlan, build_compaction_output, build_flush_output, execute_gc,
+    ScanPagePlan, StreamingScanCursor, build_compaction_output, build_flush_output, execute_gc,
     execute_logical_maintenance_plan, execute_point_read, execute_scan_page_plan,
     execute_scan_plan,
 };
@@ -32,6 +32,7 @@ use crate::pathivu::{
 };
 
 static NEXT_ENGINE_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+const DEFAULT_LOGICAL_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// One stable read snapshot pinned by the engine until released.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +188,12 @@ impl DurabilityWait {
         self.target_seqno
     }
 
+    /// Returns the WAL byte frontier this waiter must durably cover for batch admission.
+    #[must_use]
+    pub(crate) fn durable_offset_target(&self) -> u64 {
+        self.sync_plan.durable_offset_target
+    }
+
     /// Waits until the engine's durable frontier covers `target_seqno`.
     pub async fn wait(self) -> Result<(), Error> {
         let sync_result = match task::spawn_blocking(move || execute_wal_sync_plan(self.sync_plan))
@@ -263,8 +270,8 @@ impl PagedScan {
 
     /// Prepares the next page for this scan, possibly completing inline.
     pub fn prepare_next_page(&mut self) -> Result<ScanPageDecision, Error> {
-        let (layout, page_plan) = {
-            let state = self.state.lock().expect("paged scan mutex poisoned");
+        {
+            let mut state = self.state.lock().expect("paged scan mutex poisoned");
             if state.eof {
                 return Ok(ScanPageDecision::Ready(ScanPageResponse {
                     rows: Vec::new(),
@@ -272,6 +279,17 @@ impl PagedScan {
                 }));
             }
 
+            let max_records_per_page = state.page_limits.max_records_per_page;
+            let max_bytes_per_page = state.page_limits.max_bytes_per_page;
+            if let Some(cursor) = state.stream_cursor.as_mut() {
+                let page = cursor.next_page(max_records_per_page, max_bytes_per_page);
+                let response = state.apply_page(page)?;
+                return Ok(ScanPageDecision::Ready(response));
+            }
+        }
+
+        let (layout, page_plan) = {
+            let state = self.state.lock().expect("paged scan mutex poisoned");
             let engine_state = state.core.lock_state()?;
             let page_plan = capture_scan_page_request(
                 &engine_state,
@@ -279,7 +297,6 @@ impl PagedScan {
                 &state.snapshot_handle,
                 state.range.start_bound(),
                 state.range.end_bound(),
-                state.resume_after_key.clone(),
                 state.page_limits.max_records_per_page,
                 state.page_limits.max_bytes_per_page,
             )?;
@@ -288,8 +305,9 @@ impl PagedScan {
 
         if page_plan.is_active_only() {
             let response = {
-                let page = execute_scan_page_plan(&layout, &page_plan)?;
+                let (cursor, page) = execute_scan_page_plan(&layout, &page_plan)?;
                 let mut state = self.state.lock().expect("paged scan mutex poisoned");
+                state.stream_cursor = Some(cursor);
                 state.apply_page(page)?
             };
             return Ok(ScanPageDecision::Ready(response));
@@ -326,11 +344,12 @@ impl std::fmt::Debug for DeferredScanPage {
 impl DeferredScanPage {
     /// Executes one deferred page fetch and advances the paged-scan state on success.
     pub async fn execute(self) -> Result<ScanPageResponse, Error> {
-        let page =
+        let (cursor, page) =
             task::spawn_blocking(move || execute_scan_page_plan(&self.layout, &self.page_plan))
                 .await
                 .map_err(spawn_blocking_error)??;
         let mut state = self.state.lock().expect("paged scan mutex poisoned");
+        state.stream_cursor = Some(cursor);
         state.apply_page(page)
     }
 }
@@ -725,12 +744,25 @@ impl PezhaiEngine {
             .name("pezhai-wal".into())
             .spawn(move || wal_worker_loop(worker_core, writer, command_rx))
             .map_err(Error::Io)?;
+        let (logical_tick_stop_tx, logical_tick_handle) = match spawn_logical_maintenance_timer(
+            command_tx.clone(),
+            options.logical_maintenance_interval,
+        ) {
+            Ok(timer) => timer,
+            Err(error) => {
+                let _ = command_tx.send(WalCommand::Shutdown);
+                let _ = join_handle.join();
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             core,
             wal_runtime: WalRuntime {
                 command_tx,
+                logical_tick_stop_tx: Some(logical_tick_stop_tx),
                 join_handle: Some(join_handle),
+                logical_tick_handle: Some(logical_tick_handle),
             },
         })
     }
@@ -820,7 +852,7 @@ impl PezhaiEngine {
                 snapshot_handle,
                 range,
                 page_limits,
-                resume_after_key: None,
+                stream_cursor: None,
                 eof: false,
                 released: false,
                 owns_snapshot: snapshot.is_none(),
@@ -860,11 +892,21 @@ impl PezhaiEngine {
     }
 
     fn shutdown_worker(&mut self) -> Result<(), Error> {
+        if let Some(stop_tx) = self.wal_runtime.logical_tick_stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
         let _ = self.wal_runtime.command_tx.send(WalCommand::Shutdown);
         if let Some(join_handle) = self.wal_runtime.join_handle.take() {
             join_handle.join().map_err(|_| {
                 Error::Io(std::io::Error::other(
                     "engine worker thread panicked during shutdown",
+                ))
+            })?;
+        }
+        if let Some(join_handle) = self.wal_runtime.logical_tick_handle.take() {
+            join_handle.join().map_err(|_| {
+                Error::Io(std::io::Error::other(
+                    "logical maintenance timer thread panicked during shutdown",
                 ))
             })?;
         }
@@ -900,22 +942,21 @@ struct PagedScanState {
     snapshot_handle: SnapshotHandle,
     range: ScanRange,
     page_limits: ScanPageLimits,
-    resume_after_key: Option<Vec<u8>>,
+    stream_cursor: Option<StreamingScanCursor>,
     eof: bool,
     released: bool,
     owns_snapshot: bool,
 }
 
 impl PagedScanState {
-    // The paged API advances resume state only after one page finishes so callers can preserve
-    // server-side cancellation and FIFO rules around the deferred execution step.
+    // The paged API advances the retained merge cursor only after one page
+    // completes so callers keep the same FIFO and cancellation behavior while
+    // avoiding a full scan rebuild on each fetch.
     fn apply_page(&mut self, page: crate::pani::ScanPageResult) -> Result<ScanPageResponse, Error> {
         if page.eof {
             self.eof = true;
-            self.resume_after_key = None;
+            self.stream_cursor = None;
             self.release_snapshot()?;
-        } else {
-            self.resume_after_key = page.next_resume_after_key;
         }
 
         Ok(ScanPageResponse {
@@ -945,7 +986,9 @@ impl Drop for PagedScanState {
 
 struct WalRuntime {
     command_tx: mpsc::Sender<WalCommand>,
+    logical_tick_stop_tx: Option<mpsc::Sender<()>>,
     join_handle: Option<JoinHandle<()>>,
+    logical_tick_handle: Option<JoinHandle<()>>,
 }
 
 struct PreparedWrite {
@@ -967,12 +1010,23 @@ enum WalCommand {
         reply: mpsc::Sender<Result<Option<WalSyncPlan>, Error>>,
     },
     MaintenanceTick,
+    LogicalMaintenanceTick,
     Shutdown,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EngineTestOptions {
     pub(crate) wal_writer: WalWriterTestOptions,
+    pub(crate) logical_maintenance_interval: Duration,
+}
+
+impl Default for EngineTestOptions {
+    fn default() -> Self {
+        Self {
+            wal_writer: WalWriterTestOptions::default(),
+            logical_maintenance_interval: DEFAULT_LOGICAL_MAINTENANCE_INTERVAL,
+        }
+    }
 }
 
 fn wal_worker_loop(
@@ -997,7 +1051,7 @@ fn wal_worker_loop(
                     Err(error) => Err(error),
                 };
                 if result.is_ok() {
-                    run_maintenance_cycle(&core, &mut writer);
+                    run_write_maintenance_cycle(&core, &mut writer);
                 }
                 let _ = reply.send(result);
             }
@@ -1043,7 +1097,10 @@ fn wal_worker_loop(
                 let _ = reply.send(result);
             }
             WalCommand::MaintenanceTick => {
-                run_maintenance_cycle(&core, &mut writer);
+                run_write_maintenance_cycle(&core, &mut writer);
+            }
+            WalCommand::LogicalMaintenanceTick => {
+                run_logical_maintenance_cycle(&core, &mut writer);
             }
             WalCommand::Shutdown => break,
         }
@@ -1052,49 +1109,37 @@ fn wal_worker_loop(
     writer.shutdown();
 }
 
-fn run_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
+// The write-triggered path keeps durability follow-on work focused on flush,
+// checkpoint, compaction, and GC so the heavier logical-shard scan no longer
+// runs once per successful WAL sync.
+fn run_write_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
     loop {
-        let (
-            page_size_bytes,
-            flush_plan,
-            compaction_plan,
-            logical_plan,
-            checkpoint_frontier,
-            gc_protected_ids,
-        ) = match core.lock_state() {
-            Ok(state) => {
-                let flush_plan = state.plan_flush();
-                let compaction_plan = if flush_plan.is_none() {
-                    state.plan_compaction()
-                } else {
-                    None
-                };
-                let logical_plan = if flush_plan.is_none() {
-                    match state.plan_logical_maintenance() {
-                        Ok(plan) => Some(plan),
+        let (page_size_bytes, flush_plan, compaction_plan, checkpoint_frontier, gc_protected_ids) =
+            match core.lock_state() {
+                Ok(state) => {
+                    let flush_plan = state.plan_flush();
+                    let compaction_plan = if flush_plan.is_none() {
+                        state.plan_compaction()
+                    } else {
+                        None
+                    };
+                    let gc_protected_ids = match state.gc_protected_file_ids() {
+                        Ok(ids) => ids,
                         Err(_) => return,
-                    }
-                } else {
-                    None
-                };
-                let gc_protected_ids = match state.gc_protected_file_ids() {
-                    Ok(ids) => ids,
-                    Err(_) => return,
-                };
-                (
-                    state.page_size_bytes(),
-                    flush_plan,
-                    compaction_plan,
-                    logical_plan,
-                    state
-                        .durable_current()
-                        .map(|current| current.checkpoint_max_seqno)
-                        .unwrap_or(0),
-                    gc_protected_ids,
-                )
-            }
-            Err(_) => return,
-        };
+                    };
+                    (
+                        state.page_size_bytes(),
+                        flush_plan,
+                        compaction_plan,
+                        state
+                            .durable_current()
+                            .map(|current| current.checkpoint_max_seqno)
+                            .unwrap_or(0),
+                        gc_protected_ids,
+                    )
+                }
+                Err(_) => return,
+            };
 
         if let Some(plan) = flush_plan {
             if publish_flush_plan(core, writer, plan, page_size_bytes).is_err() {
@@ -1125,19 +1170,6 @@ fn run_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
             continue;
         }
 
-        if let Some(plan) = logical_plan {
-            let payload = match execute_logical_maintenance_plan(&core.layout, &plan) {
-                Ok(payload) => payload,
-                Err(_) => return,
-            };
-            if let Some(payload) = payload {
-                if publish_logical_install(core, writer, &payload).is_err() {
-                    return;
-                }
-                continue;
-            }
-        }
-
         let mut gc_candidates = match list_canonical_data_file_ids(&core.layout) {
             Ok(file_ids) => file_ids,
             Err(_) => return,
@@ -1148,6 +1180,87 @@ fn run_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
         }
         return;
     }
+}
+
+// Logical-shard maintenance stays on its own engine-owned cadence so that the
+// exact live-byte refresh happens periodically instead of after every synced
+// write batch.
+fn run_logical_maintenance_cycle(core: &EngineCore, writer: &mut WalWriter) {
+    let checkpoint_frontier = match core.lock_state() {
+        Ok(state) => {
+            if state.plan_flush().is_some() {
+                return;
+            }
+            if state.plan_compaction().is_some() {
+                return;
+            }
+            state
+                .durable_current()
+                .map(|current| current.checkpoint_max_seqno)
+                .unwrap_or(0)
+        }
+        Err(_) => return,
+    };
+    let retained_wal_bytes = match retained_wal_bytes_after(&core.layout, checkpoint_frontier) {
+        Ok(bytes) => bytes,
+        Err(_) => return,
+    };
+    let logical_plan = match core.lock_state() {
+        Ok(state) => {
+            if state.plan_flush().is_some() {
+                return;
+            }
+            if state.plan_compaction().is_some() {
+                return;
+            }
+            if state.should_checkpoint(retained_wal_bytes) {
+                return;
+            }
+            match state.plan_logical_maintenance() {
+                Ok(plan) => plan,
+                Err(_) => return,
+            }
+        }
+        Err(_) => return,
+    };
+
+    let payload = match execute_logical_maintenance_plan(&core.layout, &logical_plan) {
+        Ok(payload) => payload,
+        Err(_) => return,
+    };
+    if let Some(payload) = payload {
+        let _ = publish_logical_install(core, writer, &payload);
+    }
+}
+
+fn spawn_logical_maintenance_timer(
+    command_tx: mpsc::Sender<WalCommand>,
+    interval: Duration,
+) -> Result<(mpsc::Sender<()>, JoinHandle<()>), Error> {
+    // Keep the timer cadence explicit and bounded so tests can shorten it
+    // without letting a zero-duration configuration spin indefinitely.
+    let interval = if interval.is_zero() {
+        DEFAULT_LOGICAL_MAINTENANCE_INTERVAL
+    } else {
+        interval
+    };
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let handle = thread::Builder::new()
+        .name("pezhai-logical".into())
+        .spawn(move || {
+            loop {
+                match stop_rx.recv_timeout(interval) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if command_tx.send(WalCommand::LogicalMaintenanceTick).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(Error::Io)?;
+    Ok((stop_tx, handle))
 }
 
 fn publish_flush_plan(
@@ -1465,7 +1578,6 @@ pub(crate) fn capture_scan_page_request(
     snapshot_handle: &SnapshotHandle,
     start_bound: &Bound,
     end_bound: &Bound,
-    resume_after_key: Option<Vec<u8>>,
     max_records_per_page: u32,
     max_bytes_per_page: u32,
 ) -> Result<ScanPagePlan, Error> {
@@ -1479,7 +1591,6 @@ pub(crate) fn capture_scan_page_request(
             snapshot.snapshot_seqno,
             snapshot.data_generation,
         )?,
-        resume_after_key,
         max_records_per_page,
         max_bytes_per_page,
     })
@@ -1757,7 +1868,7 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::{
         Bound, EngineTestOptions, MAX_KEY_BYTES, MAX_VALUE_BYTES, PezhaiEngine, ScanRange,
@@ -1898,7 +2009,7 @@ checkpoint_after_wal_bytes = 1
     }
 
     #[tokio::test]
-    async fn logical_split_and_merge_update_stats_without_breaking_snapshots() {
+    async fn logical_split_and_merge_update_stats_on_timer_without_breaking_snapshots() {
         let config_path = write_test_config(
             "per_write",
             Some(
@@ -1910,10 +2021,27 @@ checkpoint_after_wal_bytes = 1073741824
 "#,
             ),
         );
-        let engine = PezhaiEngine::open(&config_path).unwrap();
+        let engine = PezhaiEngine::open_with_options(
+            &config_path,
+            EngineTestOptions {
+                logical_maintenance_interval: Duration::from_millis(200),
+                ..EngineTestOptions::default()
+            },
+        )
+        .unwrap();
 
         engine.put(b"ant", b"a").await.unwrap();
-        let split_stats = engine.stats().await.unwrap();
+        let before_tick = engine.stats().await.unwrap();
+        assert_eq!(
+            before_tick.logical_shards,
+            vec![LogicalShardStats {
+                start_bound: Bound::NegInf,
+                end_bound: Bound::PosInf,
+                live_size_bytes: 0,
+            }]
+        );
+
+        let split_stats = wait_for_logical_shard_count(&engine, 2).await;
         assert_eq!(split_stats.logical_shards.len(), 2);
         assert_eq!(
             split_stats.logical_shards[0],
@@ -1935,7 +2063,10 @@ checkpoint_after_wal_bytes = 1073741824
         let snapshot = engine.create_snapshot().await.unwrap();
         engine.delete(b"ant").await.unwrap();
 
-        let merged_stats = engine.stats().await.unwrap();
+        let before_merge_tick = engine.stats().await.unwrap();
+        assert_eq!(before_merge_tick.logical_shards, split_stats.logical_shards);
+
+        let merged_stats = wait_for_logical_shard_count(&engine, 1).await;
         assert_eq!(
             merged_stats.logical_shards,
             vec![LogicalShardStats {
@@ -2046,6 +2177,7 @@ checkpoint_after_wal_bytes = 1073741824
                 fail_at_seqno: Some(1),
                 fail_sync_at_seqno: None,
             },
+            ..EngineTestOptions::default()
         };
         let engine = PezhaiEngine::open_with_options(&config_path, options).unwrap();
 
@@ -2107,6 +2239,34 @@ l0_file_threshold = 2
     }
 
     #[tokio::test]
+    async fn point_reads_reuse_decoded_data_files_within_one_generation() {
+        let config_path = write_test_config(
+            "per_write",
+            Some(
+                r#"
+[lsm]
+memtable_flush_bytes = 16384
+l0_file_threshold = 2
+"#,
+            ),
+        );
+        let engine = PezhaiEngine::open(&config_path).unwrap();
+
+        engine.put(b"ant", &big_value(b'a')).await.unwrap();
+        engine.put(b"ant", &big_value(b'b')).await.unwrap();
+
+        let latest = engine.get(b"ant", None).await.unwrap();
+        assert_eq!(latest.value, Some(big_value(b'b')));
+        assert_eq!(current_cache_miss_count(&engine), 1);
+
+        let repeated = engine.get(b"ant", None).await.unwrap();
+        assert_eq!(repeated.value, Some(big_value(b'b')));
+        assert_eq!(current_cache_miss_count(&engine), 1);
+
+        engine.close().unwrap();
+    }
+
+    #[tokio::test]
     async fn compaction_updates_level_stats_and_preserves_reads() {
         let config_path = write_test_config(
             "per_write",
@@ -2154,6 +2314,7 @@ l0_file_threshold = 2
                 fail_at_seqno: Some(3),
                 fail_sync_at_seqno: None,
             },
+            ..EngineTestOptions::default()
         };
         let engine = PezhaiEngine::open_with_options(&config_path, options).unwrap();
 
@@ -2242,5 +2403,25 @@ listen_addr = "127.0.0.1:0"
 
     fn big_value(fill: u8) -> Vec<u8> {
         vec![fill; 9000]
+    }
+
+    async fn wait_for_logical_shard_count(
+        engine: &PezhaiEngine,
+        expected_count: usize,
+    ) -> StatsResponse {
+        for _ in 0..50 {
+            let stats = engine.stats().await.unwrap();
+            if stats.logical_shards.len() == expected_count {
+                return stats;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        panic!("timed out waiting for {expected_count} logical shards");
+    }
+
+    fn current_cache_miss_count(engine: &PezhaiEngine) -> u64 {
+        let state = engine.core.lock_state().unwrap();
+        state.current_manifest.decoded_data_files.cache_miss_count()
     }
 }

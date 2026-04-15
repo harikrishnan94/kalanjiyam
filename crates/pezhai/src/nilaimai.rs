@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use crate::config::{RuntimeConfig, SyncMode};
 use crate::error::Error;
 use crate::iyakkam::{Bound, LevelStats, LogicalShardStats, ScanRow};
+use crate::pathivu::DecodedDataFileCache;
 
 /// One visible or tombstoned version for one user key.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +251,7 @@ pub(crate) struct DataManifestSnapshot {
     pub(crate) active_memtable: MemtableRef,
     pub(crate) frozen_memtables: Vec<Arc<FrozenMemtableRef>>,
     pub(crate) levels: Vec<ManifestLevelView>,
+    pub(crate) decoded_data_files: Arc<DecodedDataFileCache>,
 }
 
 impl DataManifestSnapshot {
@@ -383,6 +385,7 @@ pub(crate) struct PointReadPlan {
     pub(crate) snapshot_seqno: u64,
     pub(crate) frozen_memtables: Vec<Arc<FrozenMemtableRef>>,
     pub(crate) candidate_files: Vec<FileMeta>,
+    pub(crate) decoded_data_files: Arc<DecodedDataFileCache>,
 }
 
 /// One scan plan that owns the immutable source set needed for later cursor reads.
@@ -394,6 +397,7 @@ pub(crate) struct ScanPlan {
     pub(crate) active_memtable: MemtableRef,
     pub(crate) frozen_memtables: Vec<Arc<FrozenMemtableRef>>,
     pub(crate) candidate_files: Vec<FileMeta>,
+    pub(crate) decoded_data_files: Arc<DecodedDataFileCache>,
 }
 
 impl ScanPlan {
@@ -516,6 +520,7 @@ impl EngineState {
             active_memtable,
             frozen_memtables: Vec::new(),
             levels: Vec::new(),
+            decoded_data_files: Arc::new(DecodedDataFileCache::new(0)),
         });
 
         let mut manifests_by_generation = BTreeMap::new();
@@ -561,12 +566,14 @@ impl EngineState {
             active_memtable: Arc::new(Mutex::new(Memtable::default())),
             frozen_memtables: Vec::new(),
             levels: Vec::new(),
+            decoded_data_files: Arc::new(DecodedDataFileCache::new(0)),
         });
         let manifest = Arc::new(DataManifestSnapshot {
             data_generation,
             active_memtable,
             frozen_memtables: Vec::new(),
             levels,
+            decoded_data_files: Arc::new(DecodedDataFileCache::new(data_generation)),
         });
 
         let mut manifests_by_generation = BTreeMap::new();
@@ -781,6 +788,7 @@ impl EngineState {
             snapshot_seqno,
             frozen_memtables: manifest.frozen_memtables.iter().rev().cloned().collect(),
             candidate_files: manifest.files_covering_key(key),
+            decoded_data_files: Arc::clone(&manifest.decoded_data_files),
         })
     }
 
@@ -801,6 +809,7 @@ impl EngineState {
             active_memtable: Arc::clone(&manifest.active_memtable),
             frozen_memtables: manifest.frozen_memtables.clone(),
             candidate_files: manifest.files_overlapping_range(start_bound, end_bound),
+            decoded_data_files: Arc::clone(&manifest.decoded_data_files),
         })
     }
 
@@ -1189,6 +1198,7 @@ impl EngineState {
             active_memtable,
             frozen_memtables,
             levels,
+            decoded_data_files: Arc::new(DecodedDataFileCache::new(next_generation)),
         });
         self.manifests_by_generation
             .insert(next_generation, Arc::clone(&next_manifest));
@@ -1478,6 +1488,7 @@ fn bound_allows_end(bound: &Bound, key: &[u8]) -> bool {
 
 /// Merges one sorted internal-record set into visible ascending scan rows.
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn visible_scan_rows(
     records: &mut [InternalRecord],
     snapshot_seqno: u64,

@@ -1,9 +1,12 @@
 //! WAL, shared-data file, and recovery helpers used by the engine runtime.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::config::SyncMode;
 use crate::error::Error;
@@ -179,9 +182,54 @@ struct DecodedWalRecord {
     body: WalRecordBody,
 }
 
-struct DecodedDataFile {
-    summary: BuiltDataFileSummary,
-    records: Vec<InternalRecord>,
+/// One decoded shared-data file body reused by point reads and scan cursors.
+#[derive(Debug)]
+pub(crate) struct DecodedDataFile {
+    pub(crate) summary: BuiltDataFileSummary,
+    pub(crate) records: Vec<InternalRecord>,
+}
+
+/// Shared decoded-state cache for one manifest generation.
+#[derive(Debug)]
+pub(crate) struct DecodedDataFileCache {
+    entries: Mutex<HashMap<u64, Arc<DecodedDataFile>>>,
+    #[cfg(test)]
+    miss_count: AtomicU64,
+}
+
+impl DecodedDataFileCache {
+    #[must_use]
+    pub(crate) fn new(_generation: u64) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            miss_count: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn get_or_load(
+        &self,
+        layout: &StoreLayout,
+        file_meta: &FileMeta,
+    ) -> Result<Arc<DecodedDataFile>, Error> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| Error::Corruption("decoded file cache lock poisoned".into()))?;
+        if let Some(cached) = entries.get(&file_meta.file_id) {
+            return Ok(Arc::clone(cached));
+        }
+        #[cfg(test)]
+        self.miss_count.fetch_add(1, Ordering::Relaxed);
+        let decoded = Arc::new(read_data_file(&layout.data_file_path(file_meta.file_id))?);
+        entries.insert(file_meta.file_id, Arc::clone(&decoded));
+        Ok(decoded)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cache_miss_count(&self) -> u64 {
+        self.miss_count.load(Ordering::Relaxed)
+    }
 }
 
 struct DecodedMetadataCheckpoint {
@@ -968,12 +1016,14 @@ pub(crate) fn load_data_file_records(
     let decoded = read_data_file(&layout.data_file_path(file_meta.file_id))?;
     Ok(decoded
         .records
-        .into_iter()
+        .iter()
         .filter(|record| key_in_range(&record.user_key, start_bound, end_bound))
+        .cloned()
         .collect())
 }
 
 /// Executes one in-file point lookup for the requested user key and snapshot seqno.
+#[allow(dead_code)]
 pub(crate) fn find_visible_record_in_data_file(
     layout: &StoreLayout,
     file_meta: &FileMeta,
@@ -988,13 +1038,13 @@ pub(crate) fn find_visible_record_in_data_file(
         })
         .unwrap_or_else(|index| index);
 
-    for record in decoded.records.into_iter().skip(search_index) {
+    for record in decoded.records.iter().skip(search_index) {
         match record.user_key.as_slice().cmp(user_key) {
             std::cmp::Ordering::Less => continue,
             std::cmp::Ordering::Greater => return Ok(None),
             std::cmp::Ordering::Equal => {
                 if record.seqno <= snapshot_seqno {
-                    return Ok(Some(record));
+                    return Ok(Some(record.clone()));
                 }
             }
         }

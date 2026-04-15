@@ -66,7 +66,8 @@ and response publication.
 
 The WAL sync actor is a separate Tokio task with its own bounded channel for
 public `DurabilityWait` handles returned by prepared writes. The actor batches
-pending waits until `wal.group_commit_max_delay_ms` expires, executes only the
+pending waits until either `wal.group_commit_bytes` worth of durable bytes has
+accumulated or `wal.group_commit_max_delay_ms` expires, executes only the
 highest target in the batch, and reports success or failure back to the owner.
 
 Success releases every waiter whose target is covered by that durable frontier.
@@ -117,6 +118,12 @@ owner validates worker results, publishes them, and keeps caps on concurrency:
 one checkpoint, one logical task, one GC, and configurable flush/compaction
 limits. Worker tasks send results back over the control channel so the owner can
 accept, retry, or drop them.
+
+A dedicated internal timer now issues the logical-shard maintenance tick once
+per second instead of after every `DurabilityWait`. Flush, compaction,
+checkpoint, and GC work still run as part of the per-write maintenance cycle,
+but the heavier logical recomputation only runs when the timer fires, so stats
+are only a second stale at most while avoiding repeated full-keyspace scans.
 
 Maintenance `IO` failures retry internally with `50ms`, `200ms`, and `1s`
 backoffs; after the third retry the stale attempt is dropped so the next sweep
